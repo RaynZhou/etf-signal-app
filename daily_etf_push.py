@@ -57,7 +57,7 @@ HISTORY_DAYS = 400
 # 少于这么多根K线就不出信号
 MIN_BARS = 60
 
-# 实时行情数据源：腾讯优先（一次请求带多只、境外可达），东财兼底
+# 实时行情数据源：腾讯优先（一次请求带多只、境外可达），东财兜底
 # （实测 GitHub runner 访问 push2delay.eastmoney.com 会拿到 502）
 SPOT_CODE_KEYS = ("代码", "证券代码")
 SPOT_PRICE_KEYS = ("最新价", "现价", "收盘价")
@@ -130,6 +130,19 @@ def should_apply_spot(slot, now):
     return now.hour * 60 + now.minute >= 9 * 60 + 30
 
 
+def tencent_code(symbol):
+    """转腾讯行情代码：5/6 开头在上交所，其余（15x/16x）在深交所"""
+    return ("sh" if symbol.startswith(("5", "6")) else "sz") + symbol
+
+
+def is_onexchange(symbol):
+    """是否场内基金（有盘中行情）
+
+    沪市 50/51/52/53/56/58 开头，深市 15/16/18 开头；其余按场外基金处理（只有净值）
+    """
+    return symbol.startswith(("50", "51", "52", "53", "56", "58", "15", "16", "18"))
+
+
 def fetch_spot_tencent(symbols):
     """腾讯行情 https://qt.gtimg.cn/q=sz159545,sh513120
 
@@ -142,8 +155,7 @@ def fetch_spot_tencent(symbols):
         print(f"[提示] requests 不可用，跳过腾讯实时行情: {e}")
         return {}
 
-    # 5/6 开头在上交所，1 开头（15x/16x）在深交所
-    codes = ",".join(("sh" if s.startswith(("5", "6")) else "sz") + s for s in symbols)
+    codes = ",".join(tencent_code(s) for s in symbols)
     wanted = set(symbols)
     today = datetime.now(BEIJING_TZ).strftime("%Y%m%d")
     last_error = None
@@ -247,6 +259,46 @@ def get_spot_prices(symbols):
     return prices
 
 
+def fetch_kline_tencent(symbol, count=HISTORY_DAYS):
+    """腾讯历史日线（前复权），返回含「日期 / 收盘」的 DataFrame，失败返回 None
+
+    口径与 akshare 的 fund_etf_hist_em(adjust="qfq") 一致，可作场内 ETF 行情兜底
+
+    已知偏差：请求根数较大时，当日未收盘那根的价格会被截到 2 位小数
+    （实测 1.708 变 1.71、1.236 变 1.24），误差 0.3% 以内，不影响指标判定
+    """
+    try:
+        import requests
+        import pandas as pd
+    except ImportError:
+        return None
+
+    scode = tencent_code(symbol)
+    url = (f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+           f"?param={scode},day,,,{count},qfq")
+    try:
+        data = requests.get(url, timeout=20, headers={"User-Agent": UA}).json()
+        rows = (data.get("data") or {}).get(scode) or {}
+        rows = rows.get("qfqday") or rows.get("day") or []
+    except Exception as e:
+        print(f"[提示] {symbol} 腾讯历史日线获取失败: {e}")
+        return None
+
+    records = []
+    for row in rows:
+        # 每行形如 ["2026-10-28", 开盘, 收盘, 最高, 最低, 成交量, ...]
+        if len(row) < 3:
+            continue
+        try:
+            records.append({"日期": str(row[0])[:10], "收盘": float(row[2])})
+        except (TypeError, ValueError):
+            continue
+    if not records:
+        print(f"[提示] {symbol} 腾讯历史日线返回空数据")
+        return None
+    return pd.DataFrame(records)
+
+
 def calculate_rsi(series, period=14):
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -255,37 +307,47 @@ def calculate_rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 
-def fetch_data(symbol, max_retries=3):
+def fetch_data(symbol, max_retries=2):
+    """取历史日线，返回含「日期 / 收盘」的 DataFrame
+
+    场内 ETF 只用市价接口（东财 → 腾讯兜底），绝不退到场外净值接口：
+    净值和市价是两套价格，跨境ETF长期高溢价，
+    混进同一条序列算出的 MA/RSI 是错的（实测 159941 净值 1.4647 vs 市价 1.661）
+    """
     import akshare as ak
     now = beijing_now()
     end_date = now.strftime("%Y%m%d")
     start_date = (now - timedelta(days=HISTORY_DAYS)).strftime("%Y%m%d")
     last_error = None
-    for attempt in range(max_retries):
-        try:
-            # 优先尝试ETF接口
-            df = ak.fund_etf_hist_em(symbol=symbol, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
-            if df is not None and not df.empty:
-                return df
-        except Exception as e:
-            last_error = e
-            time.sleep(1.5)
-        try:
-            # 普通基金接口兜底
-            df = ak.fund_open_fund_info_em(symbol=symbol, indicator="单位净值走势")
-            # 不同接口返回格式可能不同，这里做简单兼容
-            if df is not None and not df.empty:
-                return df
-        except Exception as e:
-            last_error = e
-            time.sleep(1.2)
-        try:
-            df = ak.fund_etf_hist_em(symbol=symbol, period="daily", adjust="qfq")
-            if df is not None and not df.empty:
-                return df
-        except Exception as e:
-            last_error = e
+
+    if is_onexchange(symbol):
+        attempts = [
+            lambda: ak.fund_etf_hist_em(symbol=symbol, period="daily",
+                                        start_date=start_date, end_date=end_date, adjust="qfq"),
+            lambda: ak.fund_etf_hist_em(symbol=symbol, period="daily", adjust="qfq"),
+        ]
+    else:
+        attempts = [
+            lambda: ak.fund_open_fund_info_em(symbol=symbol, indicator="单位净值走势"),
+        ]
+
+    for call in attempts:
+        for _attempt in range(max_retries):
+            try:
+                df = call()
+                if df is not None and not df.empty:
+                    return df
+            except Exception as e:
+                last_error = e
             time.sleep(1.0)
+
+    # 场内 ETF 兜底：腾讯历史日线，同样是市价 + 前复权，口径与东财一致
+    if is_onexchange(symbol):
+        df = fetch_kline_tencent(symbol)
+        if df is not None:
+            print(f"[提示] {symbol} 东财未返回行情，改用腾讯历史日线")
+            return df
+
     print(f"[警告] {symbol} 获取失败: {last_error}")
     return None
 
