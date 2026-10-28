@@ -1,14 +1,37 @@
 name: Daily ETF Signal Push
 
+# 为什么不是一个时间点一个 cron：
+# GitHub 的 schedule 是 best-effort，负载高时会延迟，负载足够高时甚至会丢弃排队任务。
+# 所以改成「目标时段的整个小时里每 10 分钟触发一次」，由 daily_etf_push.py 按北京时间窗口
+# 判定是否真正推送。
+#
+# Server酱免费版的约束（每天 5 条、每分钟 50 条）决定了这里的两个设计：
+#   1) 先占坑（写 cache）再推送：同一时段只会有一次发送机会，最坏情况就是这一时段没发出，
+#      绝不会因为去重失效或额度超限而反复重试把 5 条额度烧光。
+#   2) 手动触发默认 preview，只跑分析不发微信，调试不占额度；确要认真发再把 mode 选成 push。
+
 on:
   schedule:
-    # 北京时间 08:50 → UTC 00:50
-    - cron: '50 0 * * 1-5'
-    # 北京时间 11:00 → UTC 03:00
-    - cron: '0 3 * * 1-5'
-    # 北京时间 15:20 → UTC 07:20
-    - cron: '20 7 * * 1-5'
-  workflow_dispatch:  # 允许手动触发测试
+    # 北京时间 08:00-09:59（UTC 00:00-01:59）→ 覆盖盘前窗口 08:50-09:20
+    - cron: '*/10 0-1 * * 1-5'
+    # 北京时间 11:00-11:59（UTC 03:00-03:59）→ 覆盖盘中窗口 11:00-11:30
+    - cron: '*/10 3 * * 1-5'
+    # 北京时间 15:00-15:59（UTC 07:00-07:59）→ 覆盖盘后窗口 15:20-15:50
+    - cron: '*/10 7 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'preview = 只跑分析不发微信（不占额度）；push = 真发一条（占用每日 5 条额度）'
+        required: true
+        default: 'preview'
+        type: choice
+        options:
+          - preview
+          - push
+
+concurrency:
+  group: etf-push
+  cancel-in-progress: false
 
 jobs:
   push-signal:
@@ -17,17 +40,76 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: 判定推送时段（北京时间）
+        id: slot
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            date_bj=$(TZ=Asia/Shanghai date +%F)
+            slot=manual
+          else
+            out=$(python3 daily_etf_push.py --detect-slot)
+            date_bj=$(echo "$out" | sed -n 's/^date=//p')
+            slot=$(echo "$out" | sed -n 's/^slot=//p')
+          fi
+          echo "date=$date_bj" >> "$GITHUB_OUTPUT"
+          echo "slot=$slot" >> "$GITHUB_OUTPUT"
+          echo "检测结果：date=$date_bj slot=${slot:-（不在推送窗口内）}"
+
+      - name: 检查该时段是否已处理
+        id: dedup
+        if: steps.slot.outputs.slot != '' && steps.slot.outputs.slot != 'manual'
+        uses: actions/cache/restore@v4
+        with:
+          path: .push_state
+          key: etf-push-${{ steps.slot.outputs.date }}-${{ steps.slot.outputs.slot }}
+
+      - name: 不在推送窗口内，跳过
+        if: steps.slot.outputs.slot == ''
+        run: echo "当前时间不在推送窗口内，跳过"
+
+      - name: 本时段已处理过，跳过
+        if: steps.dedup.outputs.cache-hit == 'true'
+        run: echo "本时段已处理过（含延迟补跑），跳过，不再消耗额度"
+
       - name: Set up Python
+        if: steps.slot.outputs.slot != '' && steps.dedup.outputs.cache-hit != 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Install dependencies
+        if: steps.slot.outputs.slot != '' && steps.dedup.outputs.cache-hit != 'true'
+        run: pip install -q akshare pandas numpy requests
+
+      # 占坑放在推送之前：宁可「这个时段没发出」也不「重复发把额度烧光」
+      - name: 占坑（标记本时段已处理）
+        if: success() && steps.slot.outputs.slot != '' && steps.slot.outputs.slot != 'manual' && steps.dedup.outputs.cache-hit != 'true'
         run: |
-          pip install akshare pandas numpy requests -q
+          mkdir -p .push_state
+          date -u +%FT%TZ > .push_state/pushed_at
+
+      - name: 保存去重标记
+        # 极端情况下（延迟导致两个 job 同时跑）同一 key 可能已被写入，save 失败不影响推送结果
+        continue-on-error: true
+        if: success() && steps.slot.outputs.slot != '' && steps.slot.outputs.slot != 'manual' && steps.dedup.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .push_state
+          key: etf-push-${{ steps.slot.outputs.date }}-${{ steps.slot.outputs.slot }}
 
       - name: Run analysis and push
         env:
           SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+          SLOT: ${{ steps.slot.outputs.slot }}
+          MODE: ${{ github.event.inputs.mode }}
+        if: steps.slot.outputs.slot != '' && steps.dedup.outputs.cache-hit != 'true'
         run: |
-          python daily_etf_push.py
+          ARGS="--slot $SLOT"
+          # 手动触发且没显式选 push → 只预览，不动用每天 5 条的额度
+          if [ "$SLOT" = "manual" ] && [ "$MODE" != "push" ]; then
+            ARGS="$ARGS --preview"
+            echo "预览模式：只打印消息，不调用 Server酱"
+          fi
+          python daily_etf_push.py $ARGS
