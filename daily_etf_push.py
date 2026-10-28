@@ -57,9 +57,13 @@ HISTORY_DAYS = 400
 # 少于这么多根K线就不出信号
 MIN_BARS = 60
 
-# 实时行情列名（akshare 不同版本可能调整），按候选名取，取不到就降级为只用历史数据
+# 实时行情数据源：腾讯优先（一次请求带多只、境外可达），东财兼底
+# （实测 GitHub runner 访问 push2delay.eastmoney.com 会拿到 502）
 SPOT_CODE_KEYS = ("代码", "证券代码")
 SPOT_PRICE_KEYS = ("最新价", "现价", "收盘价")
+SPOT_RETRIES = 2          # 每个源的重试次数：盘后只靠这一条消息，多一次机会很便宜
+SPOT_RETRY_WAIT = 5
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 
 
 # ==================== 时间工具 ====================
@@ -111,26 +115,97 @@ def should_apply_spot(slot, now):
     return now.hour * 60 + now.minute >= 9 * 60 + 30
 
 
-def get_spot_prices(symbols):
-    """拉一次全市场 ETF 实时行情，返回 {代码: 最新价}
+def fetch_spot_tencent(symbols):
+    """腾讯行情 https://qt.gtimg.cn/q=sz159545,sh513120
 
-    接口异常或列名对不上时返回空字典，不影响主流程。
+    返回串以 ~ 分隔：[2]=代码 [3]=最新价 [30]=行情时间 yyyyMMddHHmmss
+    实测可用；失败时返回 {}，不影响主流程
+    """
+    try:
+        import requests
+    except ImportError as e:
+        print(f"[提示] requests 不可用，跳过腾讯实时行情: {e}")
+        return {}
+
+    # 5/6 开头在上交所，1 开头（15x/16x）在深交所
+    codes = ",".join(("sh" if s.startswith(("5", "6")) else "sz") + s for s in symbols)
+    wanted = set(symbols)
+    today = datetime.now(BEIJING_TZ).strftime("%Y%m%d")
+    last_error = None
+
+    for attempt in range(1, SPOT_RETRIES + 1):
+        try:
+            resp = requests.get(f"https://qt.gtimg.cn/q={codes}", timeout=20,
+                                headers={"User-Agent": UA})
+            resp.raise_for_status()
+            # 返回为 GBK；显式解码，避免编码错位把 ~ 当成多字节字符的一部分
+            text = resp.content.decode("gbk", errors="ignore")
+            prices = {}
+            for line in text.split(";"):
+                if '="' not in line:
+                    continue
+                field = line.split('="', 1)[1].strip('"').split("~")
+                if len(field) < 31:
+                    continue
+                code = field[2].strip()
+                if code not in wanted:
+                    continue
+                try:
+                    price = float(field[3])
+                except ValueError:
+                    continue
+                if math.isnan(price) or price <= 0:
+                    continue
+                # 行情时间不是今日（未开盘、数据陈旧）就不补，宁缺勿错
+                stamp = field[30].strip()
+                if len(stamp) >= 8 and stamp[:8] != today:
+                    print(f"[提示] {code} 实时行情时间为 {stamp[:8]}，不是今日，不补价")
+                    continue
+                prices[code] = price
+            return prices
+        except Exception as e:
+            last_error = e
+            if attempt < SPOT_RETRIES:
+                time.sleep(SPOT_RETRY_WAIT)
+
+    print(f"[提示] 腾讯实时行情获取失败: {last_error}")
+    return {}
+
+
+def fetch_spot_eastmoney(symbols):
+    """东财全市场 ETF 实时行情（一次拉取），返回 {代码: 最新价}
+
+    列名因 akshare 版本而异，按候选名取列；取不到就降级，
+    宁可只显示上一交易日信号，也不要让整条推送彻底失败
     """
     try:
         import akshare as ak
-        spot = ak.fund_etf_spot_em()
-    except Exception as e:
-        print(f"[警告] 实时行情获取失败，只用历史数据: {e}")
+    except ImportError as e:
+        print(f"[提示] akshare 不可用，跳过东财实时行情: {e}")
         return {}
 
-    if spot is None or spot.empty:
-        print("[警告] 实时行情返回空数据，只用历史数据")
+    spot = None
+    last_error = None
+    for attempt in range(1, SPOT_RETRIES + 1):
+        try:
+            spot = ak.fund_etf_spot_em()
+            break
+        except Exception as e:
+            last_error = e
+            if attempt < SPOT_RETRIES:
+                time.sleep(SPOT_RETRY_WAIT)
+
+    if spot is None:
+        print(f"[提示] 东财实时行情获取失败（已重试{SPOT_RETRIES}次）: {last_error}")
+        return {}
+    if spot.empty:
+        print("[提示] 东财实时行情返回空数据")
         return {}
 
     code_col = next((c for c in SPOT_CODE_KEYS if c in spot.columns), None)
     price_col = next((c for c in SPOT_PRICE_KEYS if c in spot.columns), None)
     if not code_col or not price_col:
-        print(f"[警告] 实时行情列名与预期不符，跳过补价；实际列: {list(spot.columns)[:12]}")
+        print(f"[提示] 东财实时行情列名与预期不符，跳过；实际列: {list(spot.columns)[:12]}")
         return {}
 
     wanted = set(symbols)
@@ -142,8 +217,18 @@ def get_spot_prices(symbols):
                 price = float(row[price_col])
             except (TypeError, ValueError):
                 continue
+            # NaN 或 <=0 视为停牌/无效价，不拿去补 K 线
             if not math.isnan(price) and price > 0:
                 prices[code] = price
+    return prices
+
+
+def get_spot_prices(symbols):
+    """当日实时价：腾讯优先，没取到的再用东财补位；两个都失败则返回 {}"""
+    prices = fetch_spot_tencent(symbols)
+    missing = [s for s in symbols if s not in prices]
+    if missing:
+        prices.update(fetch_spot_eastmoney(missing))
     return prices
 
 
@@ -267,6 +352,7 @@ def build_message(now, slot):
 
     lines = [f"【ETF信号助手】{now_str} {slot_label(slot)}", ""]
     stale = []
+    patched_count = 0
 
     # 自选ETF
     lines.append("⭐ 自选信号汇总：")
@@ -276,6 +362,8 @@ def build_message(now, slot):
         # 只有「本该能补当日价却没补到」才算异常；盘前不补价，拿到上一交易日数据是正常的
         if use_spot and bar_date and bar_date != today and not patched:
             stale.append(code)
+        if patched:
+            patched_count += 1
         time.sleep(0.8)  # 避免请求过快
 
     lines.append("")
@@ -295,13 +383,16 @@ def build_message(now, slot):
     lines.append("")
 
     # 数据来源说明，让消息里能看出算的是哪一天的价
-    if use_spot:
-        lines.append("ℹ 带*为当日行情（东财历史日线当日不更新，已用实时价补齐）")
-    else:
+    if slot == "pre":
         lines.append("ℹ 盘前时段，指标按上一交易日收盘计算")
+    elif patched_count:
+        lines.append(f"ℹ 带*为当日实时价（{patched_count}/{len(ETF_LIST)} 只已补齐）")
+    else:
+        # 实时价全部失败时不逐只列名单，直接说清楚整条都是上一交易日数据
+        lines.append("⚠ 当日实时价未取到，ETF 信号为上一交易日数据")
+    if stale and patched_count:
+        lines.append(f"⚠ 当日价未取到：{'、'.join(stale)}")
     lines.append(f"ℹ 场外基金（{BOND_CODE}/{OTHER_FUND}）净值为T+1，通常滞后一天")
-    if stale:
-        lines.append(f"ℹ 当日价也没取到：{'、'.join(stale)}")
     lines.append("")
 
     lines.append("💡 有死叉或重大利空优先减仓，本信息仅供参考")
