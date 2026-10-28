@@ -17,6 +17,7 @@
 import os
 import sys
 import time
+import math
 import argparse
 from datetime import datetime, timedelta, timezone
 
@@ -56,6 +57,10 @@ HISTORY_DAYS = 400
 # 少于这么多根K线就不出信号
 MIN_BARS = 60
 
+# 实时行情列名（akshare 不同版本可能调整），按候选名取，取不到就降级为只用历史数据
+SPOT_CODE_KEYS = ("代码", "证券代码")
+SPOT_PRICE_KEYS = ("最新价", "现价", "收盘价")
+
 
 # ==================== 时间工具 ====================
 def beijing_now():
@@ -94,6 +99,54 @@ def is_trade_day(now):
 
 
 # ==================== 数据与指标 ====================
+def should_apply_spot(slot, now):
+    """是否用实时价补当日K线
+
+    盘前（未开盘）绝对不能补：那时实时接口的「最新价」就是昨收，
+    补进去等于凭空多插一根平盘K线，会把 MA/RSI 算歪。
+    盘中、盘后补：此时最新价是当日真实价格，15:20 那条才能算出当日信号。
+    """
+    if slot == "pre":
+        return False
+    return now.hour * 60 + now.minute >= 9 * 60 + 30
+
+
+def get_spot_prices(symbols):
+    """拉一次全市场 ETF 实时行情，返回 {代码: 最新价}
+
+    接口异常或列名对不上时返回空字典，不影响主流程。
+    """
+    try:
+        import akshare as ak
+        spot = ak.fund_etf_spot_em()
+    except Exception as e:
+        print(f"[警告] 实时行情获取失败，只用历史数据: {e}")
+        return {}
+
+    if spot is None or spot.empty:
+        print("[警告] 实时行情返回空数据，只用历史数据")
+        return {}
+
+    code_col = next((c for c in SPOT_CODE_KEYS if c in spot.columns), None)
+    price_col = next((c for c in SPOT_PRICE_KEYS if c in spot.columns), None)
+    if not code_col or not price_col:
+        print(f"[警告] 实时行情列名与预期不符，跳过补价；实际列: {list(spot.columns)[:12]}")
+        return {}
+
+    wanted = set(symbols)
+    prices = {}
+    for _, row in spot.iterrows():
+        code = str(row[code_col]).strip()
+        if code in wanted:
+            try:
+                price = float(row[price_col])
+            except (TypeError, ValueError):
+                continue
+            if not math.isnan(price) and price > 0:
+                prices[code] = price
+    return prices
+
+
 def calculate_rsi(series, period=14):
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -137,15 +190,17 @@ def fetch_data(symbol, max_retries=3):
     return None
 
 
-def analyze_one(symbol):
-    """分析单只，返回 (展示文本, 数据基准日)
+def analyze_one(symbol, now, spot_prices, use_spot=True):
+    """分析单只，返回 (展示文本, 数据基准日, 是否用了当日实时价)
 
-    数据基准日形如 '10-28'，用来暴露"盘前/盘中拿到的其实还是昨天数据"这种情况。
+    数据基准日形如 '10-28'，用来暴露"东财历史日线当天还没收录当日K线"这种情况；
+    此时若 use_spot 为真，会用实时价补一根当日K线，基准日后标 * 号。
     """
     try:
+        import pandas as pd
         df = fetch_data(symbol)
         if df is None or len(df) < MIN_BARS:
-            return f"• {symbol}  数据不足", ""
+            return f"• {symbol}  数据不足", "", False
 
         # 统一列名处理
         if "收盘" not in df.columns and "单位净值" in df.columns:
@@ -153,7 +208,17 @@ def analyze_one(symbol):
         if "日期" not in df.columns and "净值日期" in df.columns:
             df = df.rename(columns={"净值日期": "日期"})
 
-        df = df.sort_values("日期").reset_index(drop=True)
+        df = df[["日期", "收盘"]].sort_values("日期").reset_index(drop=True)
+
+        today = now.strftime("%Y-%m-%d")
+        patched = False
+        if use_spot and str(df.iloc[-1]["日期"])[:10] < today and symbol in spot_prices:
+            df = pd.concat(
+                [df, pd.DataFrame([{"日期": today, "收盘": spot_prices[symbol]}])],
+                ignore_index=True,
+            )
+            patched = True
+
         df["MA20"] = df["收盘"].rolling(20).mean()
         df["MA60"] = df["收盘"].rolling(60).mean()
         df["RSI"] = calculate_rsi(df["收盘"], 14)
@@ -184,11 +249,11 @@ def analyze_one(symbol):
         elif death:
             extra = " 死叉"
 
-        suffix = f" ({bar_date[5:]})" if bar_date else ""
-        return f"• {symbol}  {signal}  RSI:{rsi}{extra}{suffix}", bar_date[5:]
+        suffix = f" ({bar_date[5:]}{'*' if patched else ''})" if bar_date else ""
+        return f"• {symbol}  {signal}  RSI:{rsi}{extra}{suffix}", bar_date[5:], patched
     except Exception as e:
         print(f"[警告] {symbol} 分析失败: {e}")
-        return f"• {symbol}  分析失败", ""
+        return f"• {symbol}  分析失败", "", False
 
 
 # ==================== 消息拼装与推送 ====================
@@ -196,42 +261,48 @@ def build_message(now, slot):
     now_str = now.strftime("%Y-%m-%d %H:%M")
     today = now.strftime("%m-%d")
 
+    # 只拉一次全市场实时行情，所有 ETF 复用，避免逐只重复请求
+    use_spot = should_apply_spot(slot, now)
+    spot_prices = get_spot_prices(ETF_LIST) if use_spot else {}
+
     lines = [f"【ETF信号助手】{now_str} {slot_label(slot)}", ""]
     stale = []
 
     # 自选ETF
     lines.append("⭐ 自选信号汇总：")
     for code in ETF_LIST:
-        text, bar_date = analyze_one(code)
+        text, bar_date, patched = analyze_one(code, now, spot_prices, use_spot=use_spot)
         lines.append(text)
-        if bar_date and bar_date != today:
+        # 只有「本该能补当日价却没补到」才算异常；盘前不补价，拿到上一交易日数据是正常的
+        if use_spot and bar_date and bar_date != today and not patched:
             stale.append(code)
         time.sleep(0.8)  # 避免请求过快
 
     lines.append("")
 
-    # 债市晴雨表
+    # 债市晴雨表（场外基金，没有实时价，净值本身 T+1）
     lines.append(f"📊 债市晴雨表（{BOND_CODE}）：")
-    text, bar_date = analyze_one(BOND_CODE)
+    text, bar_date, _ = analyze_one(BOND_CODE, now, spot_prices, use_spot=False)
     lines.append(text)
-    if bar_date and bar_date != today:
-        stale.append(BOND_CODE)
 
     lines.append("")
 
     # 单独基金
     lines.append(f"📌 其他基金（{OTHER_FUND}）：")
-    text, bar_date = analyze_one(OTHER_FUND)
+    text, bar_date, _ = analyze_one(OTHER_FUND, now, spot_prices, use_spot=False)
     lines.append(text)
-    if bar_date and bar_date != today:
-        stale.append(OTHER_FUND)
 
     lines.append("")
 
-    # 数据基准日不是今天的标的单独点出来（场外基金净值本身就滞后一天）
+    # 数据来源说明，让消息里能看出算的是哪一天的价
+    if use_spot:
+        lines.append("ℹ 带*为当日行情（东财历史日线当日不更新，已用实时价补齐）")
+    else:
+        lines.append("ℹ 盘前时段，指标按上一交易日收盘计算")
+    lines.append(f"ℹ 场外基金（{BOND_CODE}/{OTHER_FUND}）净值为T+1，通常滞后一天")
     if stale:
-        lines.append(f"ℹ 数据未到今日：{'、'.join(stale)}（括号内为基准日）")
-        lines.append("")
+        lines.append(f"ℹ 当日价也没取到：{'、'.join(stale)}")
+    lines.append("")
 
     lines.append("💡 有死叉或重大利空优先减仓，本信息仅供参考")
 
