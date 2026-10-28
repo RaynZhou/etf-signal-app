@@ -289,7 +289,7 @@ def analyze_one(symbol, now, spot_prices, use_spot=True):
     """分析单只，返回 (展示文本, 数据基准日, 是否用了当日实时价)
 
     数据基准日形如 '10-28'，用来暴露"东财历史日线当天还没收录当日K线"这种情况；
-    此时若 use_spot 为真，会用实时价补一根当日K线，基准日后标全角＊号。
+    此时若 use_spot 为真，会用实时价补一根当日K线，基准日后标“当日”。
     返回的展示文本是 Markdown 列表项，供 Server酱 正文直接渲染。
     """
     try:
@@ -346,12 +346,12 @@ def analyze_one(symbol, now, spot_prices, use_spot=True):
             extra = "死叉"
 
         # Markdown 列表项：- 图标 **代码** 信号 · RSI · 重点 · 基准日
-        # 当日标记用全角＊，半角 * 在 Markdown 里会成对匹配出斜体
+        # 当日标记直接用文字：全角＊在手机上渲染得太小看不清，半角 * 又会被 Markdown 当斜体
         parts = [f"- {SIGNAL_ICONS.get(signal, '⚪')} **{symbol}** {signal}", f"RSI {rsi}"]
         if extra:
             parts.append(f"**{extra}**")
         if bar_date:
-            parts.append(f"{bar_date[5:]}{'＊' if patched else ''}")
+            parts.append(f"{bar_date[5:]} 当日" if patched else bar_date[5:])
         return " · ".join(parts), bar_date[5:], patched
     except Exception as e:
         print(f"[警告] {symbol} 分析失败: {e}")
@@ -409,7 +409,7 @@ def build_message(now, slot):
     if slot == "pre":
         notes.append("盘前时段，指标按上一交易日收盘计算")
     elif patched_count:
-        notes.append(f"带＊为当日实时价（{patched_count}/{len(ETF_LIST)} 只已补齐）")
+        notes.append(f"标“当日”的是今日实时价（{patched_count}/{len(ETF_LIST)} 只已补齐）")
     else:
         # 实时价全部失败时不逐只列名单，直接说清楚整条都是上一交易日数据
         notes.append("⚠ 当日实时价未取到，ETF 信号为上一交易日数据")
