@@ -445,6 +445,7 @@ def build_message(now, slot):
     lines = [f"**{now_str} · {slot_label(slot)}**", ""]
     stale = []
     patched_count = 0
+    fresh_count = 0
 
     # 自选ETF
     lines.append("### ⭐ 自选ETF")
@@ -452,7 +453,11 @@ def build_message(now, slot):
     for code in ETF_LIST:
         text, bar_date, patched = analyze_one(code, now, spot_prices, use_spot=use_spot)
         lines.append(text)
-        # 只有「本该能补当日价却没补到」才算异常；盘前不补价，拿到上一交易日数据是正常的
+        # 当日数据有两条来路：历史接口自己收录了，或用实时价补了一根，
+        # 说明文案要能区分这两种，所以这里两个都统计
+        if bar_date == today:
+            fresh_count += 1
+        # 只有「本该能拿到当日却没拿到」才算异常；盘前不补价，拿到上一交易日数据是正常的
         if use_spot and bar_date and bar_date != today and not patched:
             stale.append(code)
         if patched:
@@ -480,16 +485,23 @@ def build_message(now, slot):
     lines.append("---")
     lines.append("")
     notes = []
+    total = len(ETF_LIST)
     if slot == "pre":
         notes.append("盘前时段，指标按上一交易日收盘计算")
-    elif patched_count:
-        notes.append(f"标“当日”的是今日实时价（{patched_count}/{len(ETF_LIST)} 只已补齐）")
+    elif not fresh_count:
+        # 历史接口和实时价都没给到今天的数据
+        notes.append("⚠ 当日行情未取到，ETF 信号为上一交易日数据")
     else:
-        # 实时价全部失败时不逐只列名单，直接说清楚整条都是上一交易日数据
-        notes.append("⚠ 当日实时价未取到，ETF 信号为上一交易日数据")
-    if stale and patched_count:
-        # 不区分“接口没给价”和“触发折算保护主动不补”，两种情况都去日志里看具体原因
-        notes.append(f"⚠ 当日价未补齐：{'、'.join(stale)}（原因见运行日志）")
+        # 判据是基准日是不是今天，不是有没有补价：
+        # 历史接口（含腾讯兜底）本身就有当日K线时 patched_count=0，但数据是当天的，
+        # 不能报“当日行情未取到”
+        if patched_count:
+            notes.append(f"标“当日”的是今日实时价（{patched_count}/{total} 只）")
+        else:
+            notes.append(f"ETF 信号已含当日行情（{fresh_count}/{total} 只）")
+        if stale:
+            # 不区分“接口没给价”和“触发折算保护主动不补”，两种情况都去日志里看具体原因
+            notes.append(f"⚠ 当日价未补齐：{'、'.join(stale)}（原因见运行日志）")
     notes.append(f"场外基金（{BOND_CODE}/{OTHER_FUND}）净值为 T+1，通常滞后一天")
     lines.extend(f"- {note}" for note in notes)
     lines.append("")
