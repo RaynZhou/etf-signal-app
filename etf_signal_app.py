@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ETF 量化信号助手 - 高对比度深色主题版
+ETF 量化信号助手 - 带自选列表 + 高对比度深色主题
 """
 
 import streamlit as st
@@ -19,127 +19,44 @@ st.set_page_config(
 # 高对比度深色主题
 st.markdown("""
 <style>
-    /* 整体背景 */
-    .stApp {
-        background-color: #0b0f19;
-        color: #f1f5f9;
-    }
-    
-    /* 主标题 */
-    .main-header {
-        font-size: 1.7rem;
-        font-weight: 800;
-        color: #f8fafc !important;
-        text-align: center;
-        margin-bottom: 0.3rem;
-    }
-    .sub-header {
-        font-size: 0.95rem;
-        color: #94a3b8 !important;
-        text-align: center;
-        margin-bottom: 1.5rem;
-    }
-    
-    /* 决策结果 */
-    .decision-buy {
-        background: linear-gradient(135deg, #065f46, #047857);
-        color: #ecfdf5 !important;
-        padding: 1.3rem;
-        border-radius: 14px;
-        text-align: center;
-        font-size: 1.5rem;
-        font-weight: 800;
-        border: 1px solid #34d399;
-    }
-    .decision-sell {
-        background: linear-gradient(135deg, #7f1d1d, #b91c1c);
-        color: #fef2f2 !important;
-        padding: 1.3rem;
-        border-radius: 14px;
-        text-align: center;
-        font-size: 1.5rem;
-        font-weight: 800;
-        border: 1px solid #f87171;
-    }
-    .decision-hold {
-        background: linear-gradient(135deg, #78350f, #b45309);
-        color: #fffbeb !important;
-        padding: 1.3rem;
-        border-radius: 14px;
-        text-align: center;
-        font-size: 1.5rem;
-        font-weight: 800;
-        border: 1px solid #fbbf24;
-    }
-    .reason-text {
-        color: #e2e8f0 !important;
-        text-align: center;
-        margin: 1rem 0 1.2rem;
-        font-size: 1rem;
-    }
-    
-    /* 新闻颜色 */
+    .stApp { background-color: #0b0f19; color: #f1f5f9; }
+    .main-header { font-size: 1.7rem; font-weight: 800; color: #f8fafc !important; text-align: center; margin-bottom: 0.3rem; }
+    .sub-header { font-size: 0.95rem; color: #94a3b8 !important; text-align: center; margin-bottom: 1.2rem; }
+    .decision-buy { background: linear-gradient(135deg, #065f46, #047857); color: #ecfdf5 !important; padding: 1.3rem; border-radius: 14px; text-align: center; font-size: 1.5rem; font-weight: 800; border: 1px solid #34d399; }
+    .decision-sell { background: linear-gradient(135deg, #7f1d1d, #b91c1c); color: #fef2f2 !important; padding: 1.3rem; border-radius: 14px; text-align: center; font-size: 1.5rem; font-weight: 800; border: 1px solid #f87171; }
+    .decision-hold { background: linear-gradient(135deg, #78350f, #b45309); color: #fffbeb !important; padding: 1.3rem; border-radius: 14px; text-align: center; font-size: 1.5rem; font-weight: 800; border: 1px solid #fbbf24; }
+    .reason-text { color: #e2e8f0 !important; text-align: center; margin: 1rem 0 1.2rem; font-size: 1rem; }
     .news-pos { color: #4ade80 !important; font-weight: 600; }
     .news-neg { color: #f87171 !important; font-weight: 600; }
     .news-neu { color: #94a3b8 !important; }
-    
-    /* 强制提高 Streamlit 组件文字对比度 */
-    .stMarkdown, .stMarkdown p, .stMarkdown span, .stText, label, 
-    .stRadio label, .stSelectbox label, .stTextInput label {
-        color: #f1f5f9 !important;
-    }
-    
-    /* 输入框 */
-    .stTextInput input {
-        background-color: #1e293b !important;
-        color: #f8fafc !important;
-        border: 1px solid #475569 !important;
-        border-radius: 10px !important;
-    }
-    
-    /* 单选按钮文字 */
-    .stRadio > label, .stRadio div[role="radiogroup"] label {
-        color: #f1f5f9 !important;
-    }
-    
-    /* metric 卡片 */
-    [data-testid="stMetricValue"] {
-        color: #f8fafc !important;
-        font-weight: 700 !important;
-    }
-    [data-testid="stMetricLabel"] {
-        color: #94a3b8 !important;
-    }
-    
-    /* info / warning 盒子 */
-    .stAlert {
-        background-color: #1e293b !important;
-        color: #f1f5f9 !important;
-        border: 1px solid #334155 !important;
-    }
-    
-    /* 按钮 */
-    .stButton > button {
-        background: linear-gradient(135deg, #4f46e5, #7c3aed) !important;
-        color: white !important;
-        font-weight: 700 !important;
-        border: none !important;
-        border-radius: 10px !important;
-    }
-    
-    /* 分隔线 */
-    hr {
-        border-color: #334155 !important;
-    }
-    
-    /* expander */
-    .streamlit-expanderHeader {
-        color: #f1f5f9 !important;
-        background-color: #1e293b !important;
-    }
+    .stMarkdown, .stMarkdown p, .stMarkdown span, label, .stRadio label { color: #f1f5f9 !important; }
+    .stTextInput input { background-color: #1e293b !important; color: #f8fafc !important; border: 1px solid #475569 !important; border-radius: 10px !important; }
+    [data-testid="stMetricValue"] { color: #f8fafc !important; font-weight: 700 !important; }
+    [data-testid="stMetricLabel"] { color: #94a3b8 !important; }
+    .stAlert { background-color: #1e293b !important; color: #f1f5f9 !important; border: 1px solid #334155 !important; }
+    .stButton > button { background: linear-gradient(135deg, #4f46e5, #7c3aed) !important; color: white !important; font-weight: 700 !important; border: none !important; border-radius: 10px !important; }
+    hr { border-color: #334155 !important; }
+    .watchlist-tag { display: inline-block; background: #1e293b; border: 1px solid #475569; color: #e2e8f0; padding: 4px 12px; border-radius: 20px; margin: 3px; font-size: 0.9rem; cursor: pointer; }
 </style>
 """, unsafe_allow_html=True)
 
+# ==================== 自选列表初始化 ====================
+if "watchlist" not in st.session_state:
+    st.session_state.watchlist = ["513120"]  # 默认放入一个
+
+def add_to_watchlist(code: str):
+    code = code.strip()
+    if code and code not in st.session_state.watchlist:
+        st.session_state.watchlist.append(code)
+        st.success(f"已将 {code} 加入自选")
+        st.rerun()
+
+def remove_from_watchlist(code: str):
+    if code in st.session_state.watchlist:
+        st.session_state.watchlist.remove(code)
+        st.rerun()
+
+# ==================== 技术指标相关 ====================
 def calculate_rsi(series, period=14):
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -255,11 +172,7 @@ def try_fetch_related_news(symbol: str, max_items: int = 10):
                 for _, row in df.head(max_items).iterrows():
                     title = str(row.get("新闻标题", row.get("title", "")))
                     if title:
-                        news_list.append({
-                            "title": title,
-                            "time": str(row.get("发布时间", row.get("时间", "")))[:16],
-                            "sentiment": simple_sentiment(title)
-                        })
+                        news_list.append({"title": title, "time": str(row.get("发布时间", row.get("时间", "")))[:16], "sentiment": simple_sentiment(title)})
         except Exception:
             pass
         if len(news_list) < 3:
@@ -269,13 +182,8 @@ def try_fetch_related_news(symbol: str, max_items: int = 10):
                     for _, row in df.head(20).iterrows():
                         title = str(row.iloc[0]) if len(row) > 0 else ""
                         if any(k in title for k in keywords):
-                            news_list.append({
-                                "title": title[:80],
-                                "time": "",
-                                "sentiment": simple_sentiment(title)
-                            })
-                            if len(news_list) >= max_items:
-                                break
+                            news_list.append({"title": title[:80], "time": "", "sentiment": simple_sentiment(title)})
+                            if len(news_list) >= max_items: break
             except Exception:
                 pass
     except Exception:
@@ -284,18 +192,51 @@ def try_fetch_related_news(symbol: str, max_items: int = 10):
 
 # ==================== 主界面 ====================
 st.markdown('<div class="main-header">📈 ETF 量化信号助手</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">双均线 + RSI + 消息过滤器 · 自动拉取数据</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">双均线 + RSI + 消息过滤器 · 支持自选列表</div>', unsafe_allow_html=True)
 
-col1, col2 = st.columns([3, 1])
+# ----- 自选列表区域 -----
+st.markdown("#### ⭐ 我的自选")
+if st.session_state.watchlist:
+    cols = st.columns(min(len(st.session_state.watchlist), 4))
+    for i, code in enumerate(st.session_state.watchlist):
+        with cols[i % 4]:
+            if st.button(f"{code}", key=f"wl_{code}", use_container_width=True):
+                st.session_state["selected_code"] = code
+                st.rerun()
+else:
+    st.caption("暂无自选，分析后可添加")
+
+# 删除自选
+with st.expander("管理自选（删除）"):
+    if st.session_state.watchlist:
+        del_code = st.selectbox("选择要删除的代码", st.session_state.watchlist)
+        if st.button("删除选中代码"):
+            remove_from_watchlist(del_code)
+    else:
+        st.write("当前没有自选")
+
+st.markdown("---")
+
+# ----- 代码输入 -----
+default_code = st.session_state.get("selected_code", "513120")
+col1, col2, col3 = st.columns([3, 1, 1])
 with col1:
-    symbol = st.text_input("输入ETF/基金代码", value="513120", placeholder="例如 513120、510300、159915").strip()
+    symbol = st.text_input("输入ETF/基金代码", value=default_code, placeholder="例如 513120、510300、159915").strip()
 with col2:
     st.write("")
     st.write("")
     run_btn = st.button("开始分析", type="primary", use_container_width=True)
+with col3:
+    st.write("")
+    st.write("")
+    add_btn = st.button("加入自选", use_container_width=True)
+
+if add_btn and symbol:
+    add_to_watchlist(symbol)
 
 st.markdown("---")
 
+# 新闻
 news_list = []
 suggested_score = 0
 if symbol:
@@ -305,23 +246,17 @@ if symbol:
             sentiments = [n["sentiment"] for n in news_list]
             suggested_score = suggest_news_score(sentiments)
 
-st.markdown("#### 📰 相关新闻参考（自动获取，仅供参考）")
+st.markdown("#### 📰 相关新闻参考")
 if news_list:
     for i, n in enumerate(news_list, 1):
         color_class = "news-pos" if n["sentiment"] == "利好" else ("news-neg" if n["sentiment"] == "利空" else "news-neu")
         st.markdown(f"{i}. <span class='{color_class}'>[{n['sentiment']}]</span> {n['title']} <small style='color:#64748b'>{n['time']}</small>", unsafe_allow_html=True)
-    st.caption(f"系统根据关键词初步建议消息评分： **{suggested_score}** （你仍可手动修改）")
+    st.caption(f"系统建议消息评分： **{suggested_score}** （可手动修改）")
 else:
-    st.info("暂未能自动获取到相关新闻（云端接口限制较常见）。请根据你自己看到的重仓股消息手动评分。")
+    st.info("暂未能自动获取到相关新闻。请手动评分。")
 
-st.markdown("#### ✏️ 最终消息评分（可修改）")
-news_options = {
-    "+2 重大利好": 2,
-    "+1 一般利好": 1,
-    "0 无重要消息": 0,
-    "-1 一般利空": -1,
-    "-2 重大利空": -2
-}
+st.markdown("#### ✏️ 最终消息评分")
+news_options = {"+2 重大利好": 2, "+1 一般利好": 1, "0 无重要消息": 0, "-1 一般利空": -1, "-2 重大利空": -2}
 default_idx = list(news_options.values()).index(suggested_score) if suggested_score in news_options.values() else 2
 news_label = st.radio("选择当前消息评分", list(news_options.keys()), index=default_idx, horizontal=True)
 news_score = news_options[news_label]
@@ -369,16 +304,21 @@ if run_btn:
                     chart_df = df.tail(120)[["日期", "收盘", "MA20", "MA60"]].set_index("日期")
                     st.line_chart(chart_df)
                     
+                    # 分析成功后快捷加入自选
+                    if symbol not in st.session_state.watchlist:
+                        if st.button(f"⭐ 将 {symbol} 加入自选", key="add_after_analysis"):
+                            add_to_watchlist(symbol)
+                    
                     with st.expander("操作提醒"):
                         st.markdown("""
                         - **重大利空（-2）优先级最高**，直接卖出  
                         - **买入必须同时满足**：金叉 + RSI < 65 + 重大利好(+2)  
                         - 建议单次买入不超过总仓位 30%-40%，严格执行 8%-10% 止损  
-                        - 新闻仅为辅助参考，最终以你的判断为准
+                        - 自选列表在当前浏览器会话中有效
                         """)
             except Exception as e:
                 st.error(f"分析失败：{str(e)}")
                 st.warning("行情接口可能暂时受限，请过1-2分钟重试，或换个代码测试（如 510300）。")
 
 st.markdown("---")
-st.caption("数据来源：东方财富（akshare） · 新闻为关键词辅助判断 · 仅供学习参考")
+st.caption("数据来源：东方财富（akshare） · 自选列表保存在当前会话 · 仅供学习参考")
