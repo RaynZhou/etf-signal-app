@@ -65,6 +65,16 @@ SPOT_RETRIES = 2          # 每个源的重试次数：盘后只靠这一条消�
 SPOT_RETRY_WAIT = 5
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 
+# 消息正文按 Markdown 渲染（Server酱会把 desp 当 Markdown 转 HTML）。
+# 关键：单个换行在 Markdown 里等于空格，所以必须用列表项 / 空行才能真分行，
+# 改成纯文本拼 \n 会全部挤成一堆。以后改这里请继续用 "- " 列表。
+SIGNAL_ICONS = {
+    "买入信号": "🟢",
+    "卖出/减仓": "🔴",
+    "偏空观望": "🟡",
+    "持有/观望": "🔵",
+}
+
 
 # ==================== 时间工具 ====================
 def beijing_now():
@@ -279,13 +289,14 @@ def analyze_one(symbol, now, spot_prices, use_spot=True):
     """分析单只，返回 (展示文本, 数据基准日, 是否用了当日实时价)
 
     数据基准日形如 '10-28'，用来暴露"东财历史日线当天还没收录当日K线"这种情况；
-    此时若 use_spot 为真，会用实时价补一根当日K线，基准日后标 * 号。
+    此时若 use_spot 为真，会用实时价补一根当日K线，基准日后标全角＊号。
+    返回的展示文本是 Markdown 列表项，供 Server酱 正文直接渲染。
     """
     try:
         import pandas as pd
         df = fetch_data(symbol)
         if df is None or len(df) < MIN_BARS:
-            return f"• {symbol}  数据不足", "", False
+            return f"- ⚪ **{symbol}** 数据不足", "", False
 
         # 统一列名处理
         if "收盘" not in df.columns and "单位净值" in df.columns:
@@ -330,15 +341,21 @@ def analyze_one(symbol, now, spot_prices, use_spot=True):
 
         extra = ""
         if golden:
-            extra = " 金叉"
+            extra = "金叉"
         elif death:
-            extra = " 死叉"
+            extra = "死叉"
 
-        suffix = f" ({bar_date[5:]}{'*' if patched else ''})" if bar_date else ""
-        return f"• {symbol}  {signal}  RSI:{rsi}{extra}{suffix}", bar_date[5:], patched
+        # Markdown 列表项：- 图标 **代码** 信号 · RSI · 重点 · 基准日
+        # 当日标记用全角＊，半角 * 在 Markdown 里会成对匹配出斜体
+        parts = [f"- {SIGNAL_ICONS.get(signal, '⚪')} **{symbol}** {signal}", f"RSI {rsi}"]
+        if extra:
+            parts.append(f"**{extra}**")
+        if bar_date:
+            parts.append(f"{bar_date[5:]}{'＊' if patched else ''}")
+        return " · ".join(parts), bar_date[5:], patched
     except Exception as e:
         print(f"[警告] {symbol} 分析失败: {e}")
-        return f"• {symbol}  分析失败", "", False
+        return f"- ❌ **{symbol}** 分析失败", "", False
 
 
 # ==================== 消息拼装与推送 ====================
@@ -350,12 +367,14 @@ def build_message(now, slot):
     use_spot = should_apply_spot(slot, now)
     spot_prices = get_spot_prices(ETF_LIST) if use_spot else {}
 
-    lines = [f"【ETF信号助手】{now_str} {slot_label(slot)}", ""]
+    # 推送标题栏已有“ETF信号助手·时段”，正文只留时间戳，不再重复一遍
+    lines = [f"**{now_str} · {slot_label(slot)}**", ""]
     stale = []
     patched_count = 0
 
     # 自选ETF
-    lines.append("⭐ 自选信号汇总：")
+    lines.append("### ⭐ 自选ETF")
+    lines.append("")
     for code in ETF_LIST:
         text, bar_date, patched = analyze_one(code, now, spot_prices, use_spot=use_spot)
         lines.append(text)
@@ -369,30 +388,35 @@ def build_message(now, slot):
     lines.append("")
 
     # 债市晴雨表（场外基金，没有实时价，净值本身 T+1）
-    lines.append(f"📊 债市晴雨表（{BOND_CODE}）：")
+    lines.append("### 📊 债市晴雨表")
+    lines.append("")
     text, bar_date, _ = analyze_one(BOND_CODE, now, spot_prices, use_spot=False)
     lines.append(text)
-
     lines.append("")
 
     # 单独基金
-    lines.append(f"📌 其他基金（{OTHER_FUND}）：")
+    lines.append("### 📌 其他基金")
+    lines.append("")
     text, bar_date, _ = analyze_one(OTHER_FUND, now, spot_prices, use_spot=False)
     lines.append(text)
-
     lines.append("")
 
     # 数据来源说明，让消息里能看出算的是哪一天的价
+    # 说明也用列表项，理由同上：纯文本换行在 Markdown 里不生效
+    lines.append("---")
+    lines.append("")
+    notes = []
     if slot == "pre":
-        lines.append("ℹ 盘前时段，指标按上一交易日收盘计算")
+        notes.append("盘前时段，指标按上一交易日收盘计算")
     elif patched_count:
-        lines.append(f"ℹ 带*为当日实时价（{patched_count}/{len(ETF_LIST)} 只已补齐）")
+        notes.append(f"带＊为当日实时价（{patched_count}/{len(ETF_LIST)} 只已补齐）")
     else:
         # 实时价全部失败时不逐只列名单，直接说清楚整条都是上一交易日数据
-        lines.append("⚠ 当日实时价未取到，ETF 信号为上一交易日数据")
+        notes.append("⚠ 当日实时价未取到，ETF 信号为上一交易日数据")
     if stale and patched_count:
-        lines.append(f"⚠ 当日价未取到：{'、'.join(stale)}")
-    lines.append(f"ℹ 场外基金（{BOND_CODE}/{OTHER_FUND}）净值为T+1，通常滞后一天")
+        notes.append(f"⚠ 当日价未取到：{'、'.join(stale)}")
+    notes.append(f"场外基金（{BOND_CODE}/{OTHER_FUND}）净值为 T+1，通常滞后一天")
+    lines.extend(f"- {note}" for note in notes)
     lines.append("")
 
     lines.append("💡 有死叉或重大利空优先减仓，本信息仅供参考")
@@ -482,7 +506,8 @@ def main():
     print(content)
     print("-" * 40)
 
-    title = f"ETF信号助手 {slot_label(slot)}"
+    # 标题会显示在微信通知栏，带上时间便于区分一天里的三条
+    title = f"ETF信号助手·{slot_label(slot)}·{now.strftime('%m-%d %H:%M')}"
     if not send_serverchan(title, content, preview=args.preview):
         # 退出码非 0，让 Actions 变红，避免"静默失败"
         return 1
