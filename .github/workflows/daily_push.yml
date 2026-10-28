@@ -35,10 +35,12 @@ concurrency:
 
 jobs:
   push-signal:
-    runs-on: ubuntu-latest
+    # 固定镜像版本：GitHub 正在把 ubuntu-latest 迁移到 Ubuntu 26，固定 24.04 可以避开迁移期的不确定因素
+    # （以后想跟新系统，改回 ubuntu-latest 即可）
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 判定推送时段（北京时间）
         id: slot
@@ -60,10 +62,12 @@ jobs:
       - name: 检查该时段是否已处理
         id: dedup
         if: steps.slot.outputs.slot != '' && steps.slot.outputs.slot != 'manual'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: .push_state
           key: etf-push-${{ steps.slot.outputs.date }}-${{ steps.slot.outputs.slot }}
+          # 只需要知道「坑有没有被占」，不需要把标记文件下载下来
+          lookup-only: true
 
       - name: 不在推送窗口内，跳过
         if: steps.slot.outputs.slot == ''
@@ -75,7 +79,7 @@ jobs:
 
       - name: Set up Python
         if: steps.slot.outputs.slot != '' && steps.dedup.outputs.cache-hit != 'true'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.11'
 
@@ -94,7 +98,7 @@ jobs:
         # 极端情况下（延迟导致两个 job 同时跑）同一 key 可能已被写入，save 失败不影响推送结果
         continue-on-error: true
         if: success() && steps.slot.outputs.slot != '' && steps.slot.outputs.slot != 'manual' && steps.dedup.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: .push_state
           key: etf-push-${{ steps.slot.outputs.date }}-${{ steps.slot.outputs.slot }}
