@@ -63,6 +63,11 @@ SPOT_CODE_KEYS = ("代码", "证券代码")
 SPOT_PRICE_KEYS = ("最新价", "现价", "收盘价")
 SPOT_RETRIES = 2          # 每个源的重试次数：盘后只靠这一条消息，多一次机会很便宜
 SPOT_RETRY_WAIT = 5
+# 补价保护：实时价相对历史最后一根变动超过这个比例就不补。
+# 场内ETF涨跌停限制 10%，留 5 个点余量；主要拦份额折算/除权：
+# 历史用的是前复权价（adjust="qfq"），实时价是未复权真实价，折算日两者口径不一致，
+# 直接补进去等于凭空造一根 -50% 的假暴跌K线，会把 MA20 砸穿 MA60 误报死叉。
+SPOT_JUMP_LIMIT = 0.15
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 
 # 消息正文按 Markdown 渲染（Server酱会把 desp 当 Markdown 转 HTML）。
@@ -309,11 +314,18 @@ def analyze_one(symbol, now, spot_prices, use_spot=True):
         today = now.strftime("%Y-%m-%d")
         patched = False
         if use_spot and str(df.iloc[-1]["日期"])[:10] < today and symbol in spot_prices:
-            df = pd.concat(
-                [df, pd.DataFrame([{"日期": today, "收盘": spot_prices[symbol]}])],
-                ignore_index=True,
-            )
-            patched = True
+            last_close = float(df.iloc[-1]["收盘"])
+            spot_price = spot_prices[symbol]
+            if last_close > 0 and abs(spot_price / last_close - 1) > SPOT_JUMP_LIMIT:
+                # 宁可少一根当日K线（退回上一交易日信号），也不要拿口径不一致的价算出假买卖点
+                print(f"[提示] {symbol} 实时价 {spot_price} 相对上一根 {last_close} "
+                      f"变动超过 {SPOT_JUMP_LIMIT:.0%}，疑似折算/除权，不补价")
+            else:
+                df = pd.concat(
+                    [df, pd.DataFrame([{"日期": today, "收盘": spot_price}])],
+                    ignore_index=True,
+                )
+                patched = True
 
         df["MA20"] = df["收盘"].rolling(20).mean()
         df["MA60"] = df["收盘"].rolling(60).mean()
@@ -414,7 +426,8 @@ def build_message(now, slot):
         # 实时价全部失败时不逐只列名单，直接说清楚整条都是上一交易日数据
         notes.append("⚠ 当日实时价未取到，ETF 信号为上一交易日数据")
     if stale and patched_count:
-        notes.append(f"⚠ 当日价未取到：{'、'.join(stale)}")
+        # 不区分“接口没给价”和“触发折算保护主动不补”，两种情况都去日志里看具体原因
+        notes.append(f"⚠ 当日价未补齐：{'、'.join(stale)}（原因见运行日志）")
     notes.append(f"场外基金（{BOND_CODE}/{OTHER_FUND}）净值为 T+1，通常滞后一天")
     lines.extend(f"- {note}" for note in notes)
     lines.append("")
