@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-ETF 量化信号助手 (Streamlit版)
+ETF 量化信号助手 (Streamlit版) - 增强稳定性版本
 支持输入代码（如 513120），自动拉取数据并分析
 双均线(MA20/MA60) + RSI(14) + 消息过滤器
 """
 
 import streamlit as st
-import akshare as ak
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -25,7 +24,6 @@ st.markdown("""
     .stApp { background-color: #0f0f1a; }
     .main-header { font-size: 1.6rem; font-weight: 700; color: #e2e8f0; text-align: center; margin-bottom: 0.2rem; }
     .sub-header { font-size: 0.9rem; color: #94a3b8; text-align: center; margin-bottom: 1.5rem; }
-    .metric-card { background: #1a1a2e; padding: 1rem; border-radius: 12px; text-align: center; }
     .decision-buy { background: linear-gradient(135deg, #064e3b, #065f46); color: #6ee7b7; padding: 1.2rem; border-radius: 12px; text-align: center; font-size: 1.4rem; font-weight: 800; }
     .decision-sell { background: linear-gradient(135deg, #7f1d1d, #991b1b); color: #fca5a5; padding: 1.2rem; border-radius: 12px; text-align: center; font-size: 1.4rem; font-weight: 800; }
     .decision-hold { background: linear-gradient(135deg, #78350f, #92400e); color: #fcd34d; padding: 1.2rem; border-radius: 12px; text-align: center; font-size: 1.4rem; font-weight: 800; }
@@ -40,29 +38,52 @@ def calculate_rsi(series, period=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-@st.cache_data(ttl=300)  # 缓存5分钟
-def get_etf_data(symbol: str, days: int = 400):
-    """获取ETF/基金历史数据"""
+def fetch_with_retry(symbol: str, max_retries: int = 3):
+    """带重试的数据获取，提高云环境稳定性"""
+    import akshare as ak
+    
     end_date = datetime.now().strftime("%Y%m%d")
-    start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+    start_date = (datetime.now() - timedelta(days=500)).strftime("%Y%m%d")
     
-    # 尝试多种接口
-    try:
-        df = ak.fund_etf_hist_em(symbol=symbol, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
-    except Exception:
+    last_error = None
+    
+    for attempt in range(max_retries):
         try:
-            # 有些代码需要加市场前缀
-            df = ak.fund_etf_hist_em(symbol=symbol, period="daily", adjust="qfq")
+            # 方法1：东方财富接口
+            df = ak.fund_etf_hist_em(
+                symbol=symbol,
+                period="daily",
+                start_date=start_date,
+                end_date=end_date,
+                adjust="qfq"
+            )
+            if df is not None and not df.empty:
+                return df
         except Exception as e:
-            raise Exception(f"无法获取 {symbol} 的数据，请检查代码是否正确。错误信息: {str(e)}")
+            last_error = e
+            time.sleep(1.5 * (attempt + 1))  # 递增等待
+        
+        try:
+            # 方法2：不带日期参数再试一次
+            df = ak.fund_etf_hist_em(symbol=symbol, period="daily", adjust="qfq")
+            if df is not None and not df.empty:
+                return df
+        except Exception as e:
+            last_error = e
+            time.sleep(1.2)
     
-    if df is None or df.empty:
-        raise Exception(f"获取到的 {symbol} 数据为空")
+    # 如果都失败，抛出最后的错误
+    raise Exception(f"多次尝试后仍无法获取数据。最后错误: {str(last_error)[:150]}")
+
+@st.cache_data(ttl=180, show_spinner=False)  # 缓存3分钟
+def get_etf_data(symbol: str):
+    """获取并处理ETF数据"""
+    df = fetch_with_retry(symbol)
     
     df = df.sort_values("日期").reset_index(drop=True)
     df["日期"] = pd.to_datetime(df["日期"])
     
-    # 计算指标
+    # 计算技术指标
     df["MA20"] = df["收盘"].rolling(20).mean()
     df["MA60"] = df["收盘"].rolling(60).mean()
     df["RSI"] = calculate_rsi(df["收盘"], 14)
@@ -82,10 +103,6 @@ def analyze(df):
     death_cross = (prev["MA20"] >= prev["MA60"]) and (latest["MA20"] < latest["MA60"])
     
     ma20_above = latest["MA20"] > latest["MA60"]
-    price_above_ma20 = latest["收盘"] > latest["MA20"]
-    volume_expand = False
-    if pd.notna(latest["成交量MA5"]) and latest["成交量MA5"] > 0:
-        volume_expand = latest["成交量"] >= latest["成交量MA5"] * 1.2
     
     status = {
         "日期": latest["日期"].strftime("%Y-%m-%d"),
@@ -96,11 +113,8 @@ def analyze(df):
         "金叉": golden_cross,
         "死叉": death_cross,
         "MA20在MA60上方": ma20_above,
-        "价格在MA20上方": price_above_ma20,
-        "放量": volume_expand,
     }
     
-    # 技术评分
     if golden_cross and latest["RSI"] < 65:
         tech_signal = "买入信号（金叉 + RSI过滤通过）"
         tech_score = 1.0
@@ -141,7 +155,7 @@ col1, col2 = st.columns([3, 1])
 with col1:
     symbol = st.text_input("输入ETF/基金代码", value="513120", placeholder="例如 513120、510300、159915").strip()
 with col2:
-    st.write("")  # 占位
+    st.write("")
     st.write("")
     run_btn = st.button("开始分析", type="primary", use_container_width=True)
 
@@ -159,11 +173,11 @@ news_score = news_options[news_label]
 
 st.markdown("---")
 
-if run_btn or st.session_state.get("auto_run", False):
+if run_btn:
     if not symbol:
         st.error("请输入代码")
     else:
-        with st.spinner(f"正在获取 {symbol} 数据并计算指标..."):
+        with st.spinner(f"正在获取 {symbol} 数据（可能需要几秒，请耐心等待）..."):
             try:
                 df = get_etf_data(symbol)
                 result = analyze(df)
@@ -194,17 +208,16 @@ if run_btn or st.session_state.get("auto_run", False):
                     
                     c1, c2, c3 = st.columns(3)
                     c1.metric("数据日期", status["日期"])
-                    c2.metric("金叉", "是" if status["金叉"] else "否")
-                    c3.metric("死叉", "是" if status["死叉"] else "否")
+                    c2.metric("金叉", "是 ✅" if status["金叉"] else "否")
+                    c3.metric("死叉", "是 ⚠️" if status["死叉"] else "否")
                     
                     st.info(f"**技术主信号**：{tech_signal}")
                     
-                    # 简单走势图
+                    # 走势图
                     st.markdown("#### 📈 近期走势（收盘价 + 均线）")
                     chart_df = df.tail(120)[["日期", "收盘", "MA20", "MA60"]].set_index("日期")
                     st.line_chart(chart_df)
                     
-                    # 提醒
                     with st.expander("操作提醒", expanded=False):
                         st.markdown("""
                         - **重大利空（-2）优先级最高**，直接卖出，不等技术信号  
@@ -215,7 +228,14 @@ if run_btn or st.session_state.get("auto_run", False):
                         
             except Exception as e:
                 st.error(f"分析失败：{str(e)}")
-                st.caption("常见原因：代码不存在、网络问题、或该代码暂不支持自动拉取。可尝试其他ETF代码如 510300、159915。")
+                st.warning("""
+                **可能的原因与解决方法：**
+                1. 东方财富接口暂时限制了云服务器访问（最常见）→ 请过 1-2 分钟再点「开始分析」重试
+                2. 代码输入错误 → 确认是 6 位数字，如 513120、510300、159915
+                3. 网络波动 → 刷新页面后再试一次
+                
+                如果持续失败，可以稍后再试，或换一个代码测试（例如 510300）。
+                """)
 
 st.markdown("---")
-st.caption("数据来源：东方财富（akshare） · 缓存5分钟 · 仅供学习参考")
+st.caption("数据来源：东方财富（akshare） · 自动重试机制 · 缓存3分钟 · 仅供学习参考")
