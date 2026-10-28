@@ -1,0 +1,33 @@
+name: Daily ETF Signal Push
+
+on:
+  schedule:
+    # 北京时间 08:50 → UTC 00:50
+    - cron: '50 0 * * 1-5'
+    # 北京时间 11:00 → UTC 03:00
+    - cron: '0 3 * * 1-5'
+    # 北京时间 15:20 → UTC 07:20
+    - cron: '20 7 * * 1-5'
+  workflow_dispatch:  # 允许手动触发测试
+
+jobs:
+  push-signal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install akshare pandas numpy requests -q
+
+      - name: Run analysis and push
+        env:
+          SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+        run: |
+          python daily_etf_push.py
