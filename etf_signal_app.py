@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-ETF 量化信号助手 (Streamlit版) - 带简易新闻辅助评分
-支持输入代码，自动拉取行情 + 尝试获取相关新闻并给出建议评分
+ETF 量化信号助手 - 高对比度深色主题版
 """
 
 import streamlit as st
@@ -9,7 +8,6 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import time
-import re
 
 st.set_page_config(
     page_title="ETF信号助手",
@@ -18,22 +16,130 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
+# 高对比度深色主题
 st.markdown("""
 <style>
-    .stApp { background-color: #0f0f1a; }
-    .main-header { font-size: 1.6rem; font-weight: 700; color: #e2e8f0; text-align: center; margin-bottom: 0.2rem; }
-    .sub-header { font-size: 0.9rem; color: #94a3b8; text-align: center; margin-bottom: 1.5rem; }
-    .decision-buy { background: linear-gradient(135deg, #064e3b, #065f46); color: #6ee7b7; padding: 1.2rem; border-radius: 12px; text-align: center; font-size: 1.4rem; font-weight: 800; }
-    .decision-sell { background: linear-gradient(135deg, #7f1d1d, #991b1b); color: #fca5a5; padding: 1.2rem; border-radius: 12px; text-align: center; font-size: 1.4rem; font-weight: 800; }
-    .decision-hold { background: linear-gradient(135deg, #78350f, #92400e); color: #fcd34d; padding: 1.2rem; border-radius: 12px; text-align: center; font-size: 1.4rem; font-weight: 800; }
-    .reason-text { color: #94a3b8; text-align: center; margin: 0.8rem 0 1.2rem; font-size: 0.95rem; }
-    .news-pos { color: #6ee7b7; }
-    .news-neg { color: #fca5a5; }
-    .news-neu { color: #94a3b8; }
+    /* 整体背景 */
+    .stApp {
+        background-color: #0b0f19;
+        color: #f1f5f9;
+    }
+    
+    /* 主标题 */
+    .main-header {
+        font-size: 1.7rem;
+        font-weight: 800;
+        color: #f8fafc !important;
+        text-align: center;
+        margin-bottom: 0.3rem;
+    }
+    .sub-header {
+        font-size: 0.95rem;
+        color: #94a3b8 !important;
+        text-align: center;
+        margin-bottom: 1.5rem;
+    }
+    
+    /* 决策结果 */
+    .decision-buy {
+        background: linear-gradient(135deg, #065f46, #047857);
+        color: #ecfdf5 !important;
+        padding: 1.3rem;
+        border-radius: 14px;
+        text-align: center;
+        font-size: 1.5rem;
+        font-weight: 800;
+        border: 1px solid #34d399;
+    }
+    .decision-sell {
+        background: linear-gradient(135deg, #7f1d1d, #b91c1c);
+        color: #fef2f2 !important;
+        padding: 1.3rem;
+        border-radius: 14px;
+        text-align: center;
+        font-size: 1.5rem;
+        font-weight: 800;
+        border: 1px solid #f87171;
+    }
+    .decision-hold {
+        background: linear-gradient(135deg, #78350f, #b45309);
+        color: #fffbeb !important;
+        padding: 1.3rem;
+        border-radius: 14px;
+        text-align: center;
+        font-size: 1.5rem;
+        font-weight: 800;
+        border: 1px solid #fbbf24;
+    }
+    .reason-text {
+        color: #e2e8f0 !important;
+        text-align: center;
+        margin: 1rem 0 1.2rem;
+        font-size: 1rem;
+    }
+    
+    /* 新闻颜色 */
+    .news-pos { color: #4ade80 !important; font-weight: 600; }
+    .news-neg { color: #f87171 !important; font-weight: 600; }
+    .news-neu { color: #94a3b8 !important; }
+    
+    /* 强制提高 Streamlit 组件文字对比度 */
+    .stMarkdown, .stMarkdown p, .stMarkdown span, .stText, label, 
+    .stRadio label, .stSelectbox label, .stTextInput label {
+        color: #f1f5f9 !important;
+    }
+    
+    /* 输入框 */
+    .stTextInput input {
+        background-color: #1e293b !important;
+        color: #f8fafc !important;
+        border: 1px solid #475569 !important;
+        border-radius: 10px !important;
+    }
+    
+    /* 单选按钮文字 */
+    .stRadio > label, .stRadio div[role="radiogroup"] label {
+        color: #f1f5f9 !important;
+    }
+    
+    /* metric 卡片 */
+    [data-testid="stMetricValue"] {
+        color: #f8fafc !important;
+        font-weight: 700 !important;
+    }
+    [data-testid="stMetricLabel"] {
+        color: #94a3b8 !important;
+    }
+    
+    /* info / warning 盒子 */
+    .stAlert {
+        background-color: #1e293b !important;
+        color: #f1f5f9 !important;
+        border: 1px solid #334155 !important;
+    }
+    
+    /* 按钮 */
+    .stButton > button {
+        background: linear-gradient(135deg, #4f46e5, #7c3aed) !important;
+        color: white !important;
+        font-weight: 700 !important;
+        border: none !important;
+        border-radius: 10px !important;
+    }
+    
+    /* 分隔线 */
+    hr {
+        border-color: #334155 !important;
+    }
+    
+    /* expander */
+    .streamlit-expanderHeader {
+        color: #f1f5f9 !important;
+        background-color: #1e293b !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# ==================== 技术指标相关 ====================
 def calculate_rsi(series, period=14):
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -116,7 +222,7 @@ def final_decision(tech_score, news_score):
         return "【可小仓试探】", "趋势尚可且有利好，但非标准金叉，建议轻仓", "hold"
     return "【观望】", "当前无明确买卖信号，继续等待", "hold"
 
-# ==================== 新闻相关 ====================
+# 新闻相关
 POSITIVE_WORDS = ["获批", "成功", "超预期", "增长", "BD", "授权", "利好", "突破", "上涨", "创新高", "通过", "积极", "强劲", "上调", "盈利", "合作", "上市"]
 NEGATIVE_WORDS = ["失败", "不及预期", "下调", "警告", "利空", "下跌", "暂停", "终止", "推迟", "亏损", "减持", "风险", "调查", "处罚", "不及"]
 
@@ -124,42 +230,25 @@ def simple_sentiment(title: str) -> str:
     title = str(title)
     pos = sum(1 for w in POSITIVE_WORDS if w in title)
     neg = sum(1 for w in NEGATIVE_WORDS if w in title)
-    if pos > neg:
-        return "利好"
-    if neg > pos:
-        return "利空"
+    if pos > neg: return "利好"
+    if neg > pos: return "利空"
     return "中性"
 
 def suggest_news_score(sentiments: list) -> int:
-    if not sentiments:
-        return 0
-    score = 0
-    for s in sentiments:
-        if s == "利好":
-            score += 1
-        elif s == "利空":
-            score -= 1
-    if score >= 3:
-        return 2
-    if score >= 1:
-        return 1
-    if score <= -3:
-        return -2
-    if score <= -1:
-        return -1
+    if not sentiments: return 0
+    score = sum(1 if s == "利好" else -1 if s == "利空" else 0 for s in sentiments)
+    if score >= 3: return 2
+    if score >= 1: return 1
+    if score <= -3: return -2
+    if score <= -1: return -1
     return 0
 
 @st.cache_data(ttl=300, show_spinner=False)
 def try_fetch_related_news(symbol: str, max_items: int = 10):
-    """尝试获取相关新闻（能拉到多少是多少，失败就返回空）"""
     import akshare as ak
     news_list = []
-    
-    # 关键词：针对创新药ETF
     keywords = ["创新药", "港股创新药", "信达生物", "百济神州", "药明生物", "康方生物", "石药集团"]
-    
     try:
-        # 尝试东财股票新闻（如果代码是股票形态可能有效）
         try:
             df = ak.stock_news_em(symbol=symbol)
             if df is not None and not df.empty:
@@ -173,11 +262,8 @@ def try_fetch_related_news(symbol: str, max_items: int = 10):
                         })
         except Exception:
             pass
-        
-        # 如果上面没拉到，尝试一些通用财经快讯接口（不同版本akshare接口名可能不同）
         if len(news_list) < 3:
             try:
-                # 部分版本有 news_cctv 或类似
                 df = ak.news_economic_baidu(symbol="经济")
                 if df is not None and not df.empty:
                     for _, row in df.head(20).iterrows():
@@ -192,10 +278,8 @@ def try_fetch_related_news(symbol: str, max_items: int = 10):
                                 break
             except Exception:
                 pass
-                
     except Exception:
         pass
-    
     return news_list[:max_items]
 
 # ==================== 主界面 ====================
@@ -212,7 +296,6 @@ with col2:
 
 st.markdown("---")
 
-# 先尝试拉新闻（即使还没点分析也先准备）
 news_list = []
 suggested_score = 0
 if symbol:
@@ -222,7 +305,6 @@ if symbol:
             sentiments = [n["sentiment"] for n in news_list]
             suggested_score = suggest_news_score(sentiments)
 
-# 新闻展示区
 st.markdown("#### 📰 相关新闻参考（自动获取，仅供参考）")
 if news_list:
     for i, n in enumerate(news_list, 1):
@@ -232,7 +314,6 @@ if news_list:
 else:
     st.info("暂未能自动获取到相关新闻（云端接口限制较常见）。请根据你自己看到的重仓股消息手动评分。")
 
-# 消息评分（可手动改）
 st.markdown("#### ✏️ 最终消息评分（可修改）")
 news_options = {
     "+2 重大利好": 2,
@@ -241,7 +322,6 @@ news_options = {
     "-1 一般利空": -1,
     "-2 重大利空": -2
 }
-# 默认选中建议分数
 default_idx = list(news_options.values()).index(suggested_score) if suggested_score in news_options.values() else 2
 news_label = st.radio("选择当前消息评分", list(news_options.keys()), index=default_idx, horizontal=True)
 news_score = news_options[news_label]
