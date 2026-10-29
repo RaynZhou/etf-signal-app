@@ -1,9 +1,10 @@
 name: Daily ETF Signal Push
 
 # 为什么不是一个时间点一个 cron：
-# GitHub 的 schedule 是 best-effort，负载高时会延迟，负载足够高时甚至会丢弃排队任务。
-# 所以改成「目标时段的整个小时里每 10 分钟触发一次，并把分钟数错开整点」，由 daily_etf_push.py 按北京时间窗口
-# 判定是否真正推送。
+# 一是 GitHub 的 schedule 本身不可靠（best-effort，负载高时延迟、足够高时直接丢弃）；
+# 二是盘中价格每秒在变，取到推送发出有几分钟延迟，落在一个窗口里比卡死一个时刻稳。
+# 所以不管哪个来源触发，都是「目标时段的整个小时里多次触发 + 分钟数错开整点」，
+# 由 daily_etf_push.py 按北京时间窗口判定是否真正推送。
 #
 # Server酱免费版的约束（每天 5 条、每分钟 50 条）决定了这里的两个设计：
 #   1) 先占坑（写 cache）再推送：同一时段只会有一次发送机会，最坏情况就是这一时段没发出，
@@ -12,19 +13,23 @@ name: Daily ETF Signal Push
 
 on:
   schedule:
-    # 【临时诊断用，确认 schedule 能跑以后请把这一行删掉】
-    # 每 5 分钟无条件触发一次，只为尽快看出 GitHub 到底有没有在注册 schedule。
-    # 不在推送窗口内的跳会被脚本判为空时段直接跳过，不占坑也不发微信，不烧额度。
-    - cron: '*/5 * * * *'
+    # 保留但不依赖：GitHub 的 schedule 实测对本仓库根本不注册触发（yml 逐字正确、public、
+    # main 为默认分支，提交后仍零触发，社区有多个同类 Bug 报告），所以定时改走下面的
+    # workflow_dispatch 由外部定时器驱动。哪天 GitHub 修好了，这三条会自动恢复干活，
+    # 和外部触发撞在同一时段也不会发重（先占坑 + cache 去重只让第一跳真发）。
     # 分钟取 8/18/28/38/48/58 而不是 0/10/20：官方文档明确「整点开始」是 Actions
     # 高负载时段，schedule 会被延迟、负载足够高时排队任务会被直接丢弃。
-    # 错开后每个推送窗口仍命中三跳，足够扛住单跳丢失。
     # 北京时间 08:00-09:59（UTC 00:00-01:59）→ 盘前窗口 08:50-09:20 命中 08:58 / 09:08 / 09:18
     - cron: '8-58/10 0-1 * * 1-5'
     # 北京时间 11:00-11:59（UTC 03:00-03:59）→ 盘中窗口 11:00-11:30 命中 11:08 / 11:18 / 11:28
     - cron: '8-58/10 3 * * 1-5'
     # 北京时间 15:00-15:59（UTC 07:00-07:59）→ 盘后窗口 15:20-15:50 命中 15:28 / 15:38 / 15:48
     - cron: '8-58/10 7 * * 1-5'
+  # 主力定时入口：外部定时器（cron-job.org）每天在三个时段内每 5 分钟用 REST 调一次
+  # workflow_dispatch，传 source=schedule + mode=push，由脚本按北京时间窗口判定并占坑。
+  # 为什么借 workflow_dispatch 而不是更名正言顺的 repository_dispatch：后者要求
+  # fine-grained token 带 Contents: write 权限，那个权限能直接改仓库代码，token 泄露的
+  # 代价太大；Actions: write 只能触发和查看 run，改不了任何东西。
   workflow_dispatch:
     inputs:
       mode:
@@ -35,6 +40,12 @@ on:
         options:
           - preview
           - push
+      source:
+        # 外部定时器必须传 schedule；网页手动 Run workflow 时留空即可
+        description: 'schedule = 按北京时间窗口判定并占坑（外部定时器用）；留空 = 手动调试，不占坑'
+        required: false
+        default: ''
+        type: string
 
 concurrency:
   group: etf-push
@@ -53,8 +64,11 @@ jobs:
         id: slot
         env:
           EVENT_NAME: ${{ github.event_name }}
+          SOURCE: ${{ github.event.inputs.source }}
         run: |
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+          # 网页手动 Run workflow（没填 source）→ manual：不占坑，配合默认 preview 随便调试
+          # 外部定时器（source=schedule）→ 走窗口判定，命中才发且占坑
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$SOURCE" != "schedule" ]; then
             date_bj=$(TZ=Asia/Shanghai date +%F)
             slot=manual
           else
