@@ -1,5 +1,10 @@
 name: Daily ETF Signal Push
 
+# 台账 signals.json 要跨天累计胜率，所以需要回写仓库。
+# 只给 contents: write（GITHUB_TOKEN 仅限本仓库），不用外部 PAT。
+permissions:
+  contents: write
+
 # 为什么不是一个时间点一个 cron：
 # 一是 GitHub 的 schedule 本身不可靠（best-effort，负载高时延迟、足够高时直接丢弃）；
 # 二是盘中价格每秒在变，取到推送发出有几分钟延迟，落在一个窗口里比卡死一个时刻稳。
@@ -59,6 +64,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          # 提交台账时需要 rebase，浅克隆会让 git pull --rebase 报 unrelated histories
+          fetch-depth: 0
 
       - name: 判定推送时段（北京时间）
         id: slot
@@ -138,3 +146,27 @@ jobs:
             echo "预览模式：只打印消息，不调用 Server酱"
           fi
           python daily_etf_push.py $ARGS
+
+      # 台账只在盘后那条写（盘中价随时在变，记下去会把当天信号定成当时那个快照）
+      # 提交失败不影响推送结果：第二天照常跑，不阻断主流程
+      - name: 提交信号台账
+        continue-on-error: true
+        if: success() && steps.slot.outputs.slot == 'close'
+        run: |
+          if [ ! -f signals.json ]; then
+            echo "没有台账文件，跳过"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add signals.json
+          if git diff --cached --quiet; then
+            echo "台账无变化，跳过提交"
+            exit 0
+          fi
+          git commit -m "chore: 更新信号台账 $(TZ=Asia/Shanghai date +%F)"
+          # 别人可能刚推过代码，先 rebase 再推；失败一次就重试一次
+          git push origin "HEAD:${GITHUB_REF_NAME}" || {
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          }
