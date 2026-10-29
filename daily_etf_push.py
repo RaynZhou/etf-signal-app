@@ -37,8 +37,33 @@ if hasattr(sys.stdout, "reconfigure"):
 # 从环境变量读取（GitHub Secrets）
 SENDKEY = os.getenv("SERVERCHAN_SENDKEY", "")
 
-# 自选ETF列表
-ETF_LIST = ["159545", "159941", "513120", "159330", "159699", "513330"]
+# 推送池：按大类分组，正文也按这个顺序分小节排
+# 2026-10-29 从 6 只扩到 14 只：原来 6 只全是港股/美股中概加一只沪深300，
+# A 股行业与商品一个都没有，所以「只剩 1 只长期↑」其实是池子太窄造成的，
+# 不是市场结论。扩池后的定位要写清楚：这是行情摘要（看哪行热），
+# 不是买入信号——「全都↑可以进场」这件事已经用 25 只/十年样本外证伪了
+# （39 个非重叠块均值 +0.31%，随机打乱反而有 +0.59%，p=0.617）。
+# 新增的 8 只均上市于 2016 年前，HISTORY_DAYS=600 足够 MA200 暖机。
+# ETF_LIST 由这里派生，不单独维护——两份清单迟早会改漏一份。
+#
+# 2026-10-29 把原来的「🪙 商品」拆成黄金与油气两节。拆的依据不是常识，是相关系数：
+#   用 25 只跨十年的日收益算，518880 与 162411 的 r 只有 +0.04，
+#   而同一池里 A 股行业+宽基两两中位相关是 +0.57——同类资产应该是那个样子。
+#   并且它俩恰好是全池最孤立的两只（对池内平均相关 +0.07 / +0.17）。
+#   合在一节里写「本节 1/2 只↑」，读出来的是一个不存在的「商品板块」。
+#   驱动也确实不同：518880 是人民币计价的 Au99.99（金价×汇率两层），
+#   162411 是一篮子能源企业的股权。
+ETF_GROUPS = {
+    "⭐ 自选ETF": ["159545", "159941", "513120", "159330", "159699", "513330"],
+    "🧭 宽基指数": ["159915", "510500"],
+    "🏭 行业": ["512010", "512880", "515220"],
+    "🪙 黄金": ["518880"],
+    "🛢 油气": ["162411"],
+    "🌏 海外": ["513500"],
+}
+
+# 自选ETF列表（由分组拉平，保持顺序：自选在前）
+ETF_LIST = [c for codes in ETF_GROUPS.values() for c in codes]
 
 # 债基
 BOND_CODE = "270044"
@@ -57,6 +82,15 @@ FUND_NAMES = {
     "159330": "沪深300ETF东财",
     "159699": "恒生消费ETF广发",
     "513330": "恒生互联网ETF华夏",
+    # 以下为 2026-10-29 扩池新增，名称取腾讯行情接口的官方简称
+    "159915": "创业板ETF易方达",
+    "510500": "中证500ETF南方",
+    "512010": "医药ETF易方达",
+    "512880": "证券ETF国泰",
+    "515220": "煤炭ETF国泰",
+    "518880": "黄金ETF华安",
+    "162411": "华宝油气LOF",
+    "513500": "标普500ETF博时",
     "270044": "广发双债添利债券A",
     "270023": "广发全球精选股票(QDII)人民币A",
 }
@@ -856,7 +890,7 @@ def build_message(now, slot, record=False):
     # 只拉一次全市场实时行情，所有 ETF 复用，避免逐只重复请求
     use_spot = should_apply_spot(slot, now)
     spot_prices = get_spot_prices(ETF_LIST) if use_spot else {}
-    # 溢价率同理：一次拉全市场 1600+ 只，这里只取自选那 6 只
+    # 溢价率同理：一次拉全市场 1600+ 只，这里只取池子里那 14 只
     fund_snap = fetch_fund_snapshot(ETF_LIST)
 
     # 台账先读出来：溢价基准要从里面的历史溢价中位数算，攒够了就不再信固定阈值
@@ -873,28 +907,68 @@ def build_message(now, slot, record=False):
     fresh_count = 0
     metas = []
 
-    # 自选ETF
-    lines.append("### ⭐ 自选ETF")
-    lines.append("")
-    for code in ETF_LIST:
-        text, bar_date, patched, meta = analyze_one(
-            code, now, spot_prices, use_spot=use_spot,
-            fund_snap=fund_snap, prem_base=prem_base)
-        lines.append(text)
-        if meta:
-            metas.append(meta)
-        # 当日数据有两条来路：历史接口自己收录了，或用实时价补了一根，
-        # 说明文案要能区分这两种，所以这里两个都统计
-        if bar_date == today:
-            fresh_count += 1
-        # 只有「本该能拿到当日却没拿到」才算异常；盘前不补价，拿到上一交易日数据是正常的
-        if use_spot and bar_date and bar_date != today and not patched:
-            stale.append(code)
-        if patched:
-            patched_count += 1
-        time.sleep(0.8)  # 避免请求过快
+    # 按大类分小节，每节内保持完整详情（信号/RSI/长期/溢价/基准日一个不少）
+    # 分组只是为了长正文能扫读：14 只不分节连成一片，找一只得逐行看
+    # 统计量全部定义在循环外面 —— fresh_count/patched_count/stale/metas
+    # 必须跨组累计，否则底部「N/14 只」的说明会只算到最后一组
+    # 只有 g_ups/g_downs 是每组重新算的（它本来就只该覆盖本节），
+    # 把这两个误当成跨组量、或把上面四个误当成组内量，都会算错
+    for group_name, group_codes in ETF_GROUPS.items():
+        lines.append(f"### {group_name}")
+        lines.append("")
+        g_ups = 0
+        g_downs = 0
+        for code in group_codes:
+            text, bar_date, patched, meta = analyze_one(
+                code, now, spot_prices, use_spot=use_spot,
+                fund_snap=fund_snap, prem_base=prem_base)
+            lines.append(text)
+            if meta:
+                metas.append(meta)
+                if meta.get("long") == 1:
+                    g_ups += 1
+                elif meta.get("long") == 0:
+                    g_downs += 1
+            # 当日数据有两条来路：历史接口自己收录了，或用实时价补了一根，
+            # 说明文案要能区分这两种，所以这里两个都统计
+            if bar_date == today:
+                fresh_count += 1
+            # 只有「本该能拿到当日却没拿到」才算异常；盘前不补价，拿到上一交易日数据是正常的
+            if use_spot and bar_date and bar_date != today and not patched:
+                stale.append(code)
+            if patched:
+                patched_count += 1
+            time.sleep(0.8)  # 避免请求过快
+        # 本节尾行：哪个大类在走强，一眼能对比——这是你要的「看热门行业」那层
+        # 分母跟池级宽度行同一口径：只算得出长期状态的只数，取不到数的不进分母。
+        # 否则一个组两只只取到一只时会写成 1/2，跟下面的 1 只详情对不上。
+        # 整节都算不出长期状态就不写，宁可缺这一行也不要拿 0/0 装成一个读数是 0 的组。
+        # 组内只有一只也不写：单成员的「本节 0/1 只↑」只是把标题下面那个读数
+        # 再念一遍，是冗余不是信息。黄金和油气各自成节之后就是这种情况。
+        g_known = g_ups + g_downs
+        if g_known and len(group_codes) > 1:
+            tail = f"- ▲ 本节 **{g_ups}/{g_known} 只↑**"
+            if g_downs:
+                tail += f" · {g_downs} 只↓"
+            lines.append(tail)
+        lines.append("")
 
-    lines.append("")
+    # 长期趋势宽度：一句纯事实，不引申出任何预测
+    # 为什么不写成「宽度极低后通常会反弹」，也不写成「全都↑可以进场」：
+    #   2026-10-29 两轮证伪。第一轮在本池做，宽度=1 的 20 天分散在 4 个短时段，
+    #   切非重叠块后块数为 0；拉长窗口后 p=0.60/0.55。第二轮换 25 只跨十年做样本外，
+    #   “全都↑”这类高共振共 39 个非重叠块、落在 40 个独立时段、跨 11 个年份，
+    #   均值 +0.31%，而随机打乱反而有 +0.59%，p=0.617——样本够多了，答案是没关系。
+    # 所以这里只描述当下状态，历史上接下来发生什么根本不确定。
+    ups = sum(1 for m in metas if m.get("long") == 1)
+    downs = sum(1 for m in metas if m.get("long") == 0)
+    known = ups + downs
+    if known:
+        width_text = f"- 📐 长期趋势宽度：**{ups}/{known} 只↑**"
+        if downs:
+            width_text += f" · {downs} 只↓"
+        lines.append(width_text)
+        lines.append("")
 
     # 债市晴雨表（场外基金，没有实时价，净值本身 T+1）
     lines.append("### 📊 债市晴雨表")
@@ -949,7 +1023,18 @@ def build_message(now, slot, record=False):
     lines.extend(f"- {note}" for note in notes)
     lines.append("")
 
-    lines.append("💡 有死叉或重大利空优先减仓，本信息仅供参考")
+    # 尾注只说证据支持的话。原来那句「有死叉或重大利空优先减仓」是模型
+    # 还叫「信号模型」时留下的，而金叉/死叉判方向已经被实测推翻（30 只
+    # 22260 个观测，超额≈0）——继续留着等于让一条已证伪的规则替读者做决定。
+    # 以后改这三行只加实测支持的内容，不要再写成买卖指令。
+    # 必须带 "- " 列表前缀：上面约 170 行写过这条规矩——两个 append 之间只有一
+    # 个 \n，在 Markdown 里是软换行，微信会把三句挤成一段。凑成一段就没人读完。
+    lines.append("- 💡 有证据的三件事：**长期↓** 当排除器用（↑ 内部排序≈噪声）、"
+                 "**MA200 缓冲带** 主要作用是控回撤不是选方向、"
+                 "**溢价率** 比的是该品种自己的历史中位")
+    lines.append("- 💡 已证伪的一件事：🟢金叉/🔴死叉 判断方向"
+                 "（30 只 22260 个观测，超额≈0）——它只是标记，不是买卖指令")
+    lines.append("- 💡 本信息仅供行情回顾，不构成投资建议")
 
     return "\n".join(lines)
 
