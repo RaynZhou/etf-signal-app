@@ -202,7 +202,10 @@ def render_detail(code, ev, base):
 
     st.markdown("#### 📊 技术指标")
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("收盘价", f"{ev['close']:g}")
+    # 场外基金现在用累计净值（原因见 daily_etf_push.fetch_data 里那段分红台阶的说明）。
+    # 标签必须跟着口径变：写「收盘价」会让人拿它去对天天基金上的单位净值，
+    # 270044 一个是 1.7158、一个是 1.2140，一对不上就以为算错了。
+    m1.metric("收盘价" if dp.is_onexchange(code) else "累计净值", f"{ev['close']:g}")
     m2.metric("RSI(14)", "—" if ev["rsi"] is None else f"{ev['rsi']}")
     m3.metric("MA20", f"{ev['ma20']:g}")
     m4.metric("MA60", f"{ev['ma60']:g}")
@@ -211,6 +214,13 @@ def render_detail(code, ev, base):
     c1.metric("数据基准", dp.bar_suffix(ev["bar_date"], dp.beijing_now()) or ev["bar_date"])
     c2.metric("长期趋势", long_text(ev["long"]))
     c3.metric("溢价", "—" if ev["prem"] is None else f"{ev['prem']:.2f}%")
+
+    if not dp.is_onexchange(code):
+        st.caption("场外基金只有净值、没有盘中价：净值 T+1 公布（QDII 常滞后 2 天）。"
+                   "上面四个数字全部是**累计净值**口径：单位净值每遇分红会凭空掉一笔台阶"
+                   "（270044 每季度一次，约占净值 0.85%），而它平时的日波动只有万分之几，"
+                   "一根假阴线就能把 RSI 砸低几十个点。你账户里每份值多少钱，请查每日"
+                   "公布的单位净值。")
 
     st.caption(long_hint(ev))
     if ev.get("patched"):
@@ -221,6 +231,9 @@ def render_detail(code, ev, base):
     df = ev["df"].copy()
     df["日期"] = pd.to_datetime(df["日期"])
     chart = df.tail(120)[["日期", "收盘", "MA20", "MA60"]].set_index("日期")
+    # 图例跟着口径走：场外这条线是累计净值，标成「收盘」会和上面的 metric 对不上
+    if not dp.is_onexchange(code):
+        chart = chart.rename(columns={"收盘": "累计净值"})
     st.line_chart(chart)
 
 
