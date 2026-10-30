@@ -1,5 +1,27 @@
+# 部署（Streamlit Cloud）与本地开发共用的依赖清单。
+#
+# 重要：这个文件只有 Streamlit Cloud 和本地读。
+# .github/workflows/daily_push.yml 里另有一份写死的清单：
+#     pip install -q akshare pandas numpy requests
+# 加新依赖时必须两处一起改。只改这里的话，Cloud 上的 app 正常、Actions 上会
+# ImportError —— 而且是在「占坑」之后才挂，那个时段不会重试，当天推送直接少一条。
+
 streamlit
+# etf_signal_app.py 唯一入口；推送脚本不需要它，所以没放进 workflow 那份清单
+
 akshare
+# daily_etf_push.py：历史日线、单位净值快照。境外机器上它失败是常态，
+# 场内 ETF 有腾讯历史日线兜底，净值取不到就只是少一行溢价提示
+
 requests
+# daily_etf_push.py 三处直连：腾讯行情、东财延迟接口、Server酱推送。
+# 以前只靠 akshare 的传递依赖才装上，最坏的情况是行情算完、台账写完，
+# 最后一步发不出去
+
 pandas
+# 两边都用：指标计算、补当日价时拼 DataFrame
+
 numpy
+# 目前没有任何文件直接 import 它（上一版 app 用过，现在 app 已改成调用
+# daily_etf_push 的共用函数）。pandas 会装匹配的版本，留着是因为本地
+# 回测脚本随时可能用到
