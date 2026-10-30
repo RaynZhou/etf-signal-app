@@ -736,6 +736,18 @@ def fetch_data(symbol, max_retries=2):
     净值和市价是两套价格，跨境ETF长期高溢价，
     混进同一条序列算出的 MA/RSI 是错的（实测 159941 净值 1.4647 vs 市价 1.661）
 
+    场外基金反过来：必须用累计净值，不能用单位净值。单位净值每次分红会凭空掉一笔
+    台阶（270044 每份掉 0.009~0.011 元 ≈ 净值的 0.85%，而它平时的日波动只有
+    0.008%~0.08%，等于一根 10~30 倍于平时的假阴线），累计净值在分红日不动
+    （累计分红同额增加，把台阶抵消了）。实测这根假阴线的代价：2026-01-14 分红后
+    第 8 个交易日，单位净值口径给 RSI 32.7、累计净值口径给 90.1 —— 一个读起来像
+    「接近超卖」，一个是「十四年来最强的一档」，结论完全相反，而且 Wilder 平滑
+    会让这个错误持续两三个月。270044 是季度分红（1/4/7/10 月），所以它每季度复发。
+
+    为什么换成累计净值没有副作用：无分红期间两条序列只差一个常数，而常数会
+    被 RSI 的比值约掉，也不改变「收盘 vs MA200」的相对位置。已实测验证：把每次
+    除权金额手工加回单位净值构造的严格复权序列，RSI 与直接用累计净值完全相同（86.5）。
+
     为什么要把数据源写进 attrs：三条分支给出的窗口长度差得很远——实测同一批 14 只里
     东财带日期是 400 根、东财不带日期是全历史（162411 拿到 3346 根）、腾讯是 601 根。
     对单只标的的指标没影响（滞回递推会收敛），但任何跨标的比较都会因窗口不同而不可比。
@@ -757,9 +769,13 @@ def fetch_data(symbol, max_retries=2):
                 symbol=symbol, period="daily", adjust="qfq")),
         ]
     else:
+        # 累计净值而不是单位净值，见函数开头那段分红台阶的说明。取数层就定死口径，
+        # 不留给调用方选：它们要是各自挑一条，两条序列差 39 个 RSI 点的事还会重演。
+        # 注意只改这一条路径——算溢价必须用单位净值（fetch_nav_history 那边不许动），
+        # 因为溢价是「场内价格相对每份净值的偏离」，加回了分红就不是那个东西了。
         attempts = [
             ("eastmoney-nav", lambda: ak.fund_open_fund_info_em(
-                symbol=symbol, indicator="单位净值走势")),
+                symbol=symbol, indicator="累计净值走势")),
         ]
 
     for source, call in attempts:
@@ -851,9 +867,13 @@ def evaluate_df(df, show_long=True):
     if df is None or len(df) < MIN_BARS:
         return None
 
-    # 场外基金给的是「单位净值/净值日期」，统一成「收盘/日期」，下游不用分两套
-    if "收盘" not in df.columns and "单位净值" in df.columns:
-        df = df.rename(columns={"单位净值": "收盘"})
+    # 场外基金给的是净值口径（现在是「累计净值」），统一成「收盘/日期」，下游不用分两套。
+    # 用 next() 在一串候选列名里挑，而不是写死一个：口径换过一次就会漏改另一处，
+    # 让它自适应比四处 if 更难出错。
+    nav_col = next((c for c in ("收盘", "单位净值", "累计净值", "净值")
+                    if c in df.columns), None)
+    if nav_col and nav_col != "收盘":
+        df = df.rename(columns={nav_col: "收盘"})
     if "日期" not in df.columns and "净值日期" in df.columns:
         df = df.rename(columns={"净值日期": "日期"})
     df = df[["日期", "收盘"]].sort_values("日期").reset_index(drop=True)
@@ -915,8 +935,10 @@ def evaluate(symbol, now, spot_prices=None, use_spot=False, fund_snap=None,
     source = df.attrs.get("source", "")
     bars = df.attrs.get("bars", 0)
 
-    if "收盘" not in df.columns and "单位净值" in df.columns:
-        df = df.rename(columns={"单位净值": "收盘"})
+    nav_col = next((c for c in ("收盘", "单位净值", "累计净值", "净值")
+                    if c in df.columns), None)
+    if nav_col and nav_col != "收盘":
+        df = df.rename(columns={nav_col: "收盘"})
     if "日期" not in df.columns and "净值日期" in df.columns:
         df = df.rename(columns={"净值日期": "日期"})
     df = df[["日期", "收盘"]].sort_values("日期").reset_index(drop=True)
@@ -984,8 +1006,10 @@ def analyze_one(symbol, now, spot_prices, use_spot=True, fund_snap=None,
     返回的展示文本是 Markdown 列表项，供 Server酱 正文直接渲染。
 
     第 4 项给台账用（带了日期和收盘序列），展示层不需要它，失败时为 None。
-    show_long=False 时不输出长期趋势：场外债基净值太平滑，MA200 信号几乎不动，
-    印上去只是噪音，还会让人误以为它和 ETF 用同一个阈值。
+    show_long=False 时不输出长期趋势：场外债基换成累计净值之后，MA200 已经不再被
+    分红台阶踢来踢去（十四年持续判↑、翻转 0 次），但正因如此它对这个品种毫无区分度
+    —— 一条永远为真的线印出来只是噪音，还会让人误以为它和 ETF 用同一个阈值。
+    RSI 不一样，它是会被分红砸错的，所以这个字段必须留、也必须算对。
     prem_base 是该品种自己的溢价中位数（台账攒够了才有），
     有它就用「中位数 + 偏离量」判定，没它就用绝对阈值兜底。
     """
