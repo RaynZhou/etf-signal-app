@@ -39,10 +39,9 @@ st.markdown("""
     .stApp { background-color: #0b0f19; color: #f1f5f9; }
     .main-header { font-size: 1.7rem; font-weight: 800; color: #f8fafc !important; text-align: center; margin-bottom: 0.3rem; }
     .sub-header { font-size: 0.95rem; color: #94a3b8 !important; text-align: center; margin-bottom: 1.2rem; }
-    .decision-buy { background: linear-gradient(135deg, #065f46, #047857); color: #ecfdf5 !important; padding: 1.3rem; border-radius: 14px; text-align: center; font-size: 1.5rem; font-weight: 800; border: 1px solid #34d399; }
-    .decision-sell { background: linear-gradient(135deg, #7f1d1d, #b91c1c); color: #fef2f2 !important; padding: 1.3rem; border-radius: 14px; text-align: center; font-size: 1.5rem; font-weight: 800; border: 1px solid #f87171; }
+    .decision-up { background: linear-gradient(135deg, #065f46, #047857); color: #ecfdf5 !important; padding: 1.3rem; border-radius: 14px; text-align: center; font-size: 1.5rem; font-weight: 800; border: 1px solid #34d399; }
+    .decision-down { background: linear-gradient(135deg, #7f1d1d, #b91c1c); color: #fef2f2 !important; padding: 1.3rem; border-radius: 14px; text-align: center; font-size: 1.5rem; font-weight: 800; border: 1px solid #f87171; }
     .decision-neutral { background: linear-gradient(135deg, #1e3a8a, #1d4ed8); color: #eff6ff !important; padding: 1.3rem; border-radius: 14px; text-align: center; font-size: 1.5rem; font-weight: 800; border: 1px solid #60a5fa; }
-    .decision-hold { background: linear-gradient(135deg, #78350f, #b45309); color: #fffbeb !important; padding: 1.3rem; border-radius: 14px; text-align: center; font-size: 1.5rem; font-weight: 800; border: 1px solid #fbbf24; }
     .reason-text { color: #e2e8f0 !important; text-align: center; margin: 1rem 0 1.2rem; font-size: 1rem; }
     .stMarkdown, .stMarkdown p, .stMarkdown span, label, .stRadio label { color: #f1f5f9 !important; }
     .stTextInput input { background-color: #1e293b !important; color: #f8fafc !important; border: 1px solid #475569 !important; border-radius: 10px !important; }
@@ -87,17 +86,30 @@ def load_signals(codes):
 
 # ==================== 展示：文案规则也全部来自推送脚本 ====================
 def card_class(signal):
-    """颜色只表达方向，不表达建议"""
-    return {"金叉": "decision-buy", "死叉": "decision-sell"}.get(signal, "decision-neutral")
+    """颜色只表达方向，不表达建议
+
+    类名从 decision-buy / decision-sell 改成 decision-up / decision-down。
+    文案层花了大量篇幅说「金叉不是买点」，操作提醒第一条就是「这里没有买卖指令」，
+    而视觉层给绿色大卡片挂一个叫 decision-buy 的类名——下次谁改样式，
+    一定会按「买入」去理解，文案层的工作就被抵消了。
+    按前缀匹配是因为 signal 可能是「金叉（3日前）」这种带后缀的形态。
+    """
+    if signal.startswith("金叉"):
+        return "decision-up"
+    if signal.startswith("死叉"):
+        return "decision-down"
+    return "decision-neutral"
 
 
 def plain_reason(ev):
     """一句话解释这个状态是什么意思——以及它不是什么"""
+    ago = ev.get("event_days_ago")
+    when = f"这是 {ago} 个交易日前的交叉，不是今天。" if ago else ""
     if ev["event"] == "golden":
-        return ("MA20 上穿 MA60。它在 30 只 ETF、22260 个观测的回测里对后续涨跌"
+        return (f"MA20 上穿 MA60。{when}它在 30 只 ETF、22260 个观测的回测里对后续涨跌"
                 "没有稳定预测力——这是一个标记，不是买点。")
     if ev["event"] == "death":
-        return "MA20 下穿 MA60。同样只是标记，不是卖出指令。"
+        return f"MA20 下穿 MA60。{when}同样只是标记，不是卖出指令。"
     if ev["ma20_above"]:
         return "MA20 仍在 MA60 上方，双均线排列没有被破坏。"
     return "MA20 已落到 MA60 下方。等它重新站上，再谈趋势是否修复。"
@@ -120,14 +132,18 @@ def long_hint(ev):
 
 
 def premium_text(code, ev, base=None):
-    """溢价片段：与推送同一条阈值线，heavy 才加⚠"""
+    """溢价片段：与推送同一条阈值线，只有 heavy 才加 ⚠
+
+    只要取到就印，不再「不严重就不印」：不印的话读者无法区分
+    「没有溢价数据」和「溢价正常」，而溢价是这个模型唯一还有证据支持的维度。
+    """
     prem = ev.get("prem")
     if prem is None:
         return ""
     text = f"溢价 {prem:.2f}%"
-    nav = ev.get("nav_date") or ""
-    if nav and nav != dp.beijing_now().strftime("%Y-%m-%d"):
-        text += f"({nav[5:]})"
+    label = ev.get("prem_label") or ""
+    if label:
+        text += f"({label})"
     if dp.prem_flag(prem, (base or {}).get(code)) == "heavy":
         text += "⚠"
     return text
@@ -137,7 +153,7 @@ def summary_line(code, ev, base=None):
     """一行摘要，字段顺序与微信推送完全一致（对照着看不会错位）"""
     if not ev or not ev.get("ok"):
         return f"- ⚪ **{code}** {ev.get('reason', '分析失败') if ev else '分析失败'}"
-    icon = dp.SIGNAL_ICONS.get(ev["signal"], "⚪")
+    icon = dp.signal_icon(ev["signal"])
     name = dp.FUND_NAMES.get(code, "")
     parts = [f"- {icon} **{code}**" + (f" {name}" if name else "")]
     parts.append(f"**{ev['signal']}**" if ev["event"] else ev["signal"])
@@ -161,23 +177,25 @@ def prem_note(code, ev, base):
     if prem is None:
         st.caption("溢价：东财这次没返回净值数据，跳过。")
         return
-    nav = ev.get("nav_date") or ""
-    line = (f"溢价 = {nav[5:] if nav else '净值日'} 当日收盘 / 单位净值 − 1，"
-            "价格用不复权口径。净值本身滞后一天，所以它不随盘中价变动。")
+    label = ev.get("prem_label") or "净值日"
+    line = (f"溢价 = {label} 当日收盘 / 单位净值 − 1，价格用不复权口径。"
+            "净值本身滞后 1–2 天（跨境 T+2），所以它不随盘中价变动——"
+            "盘中看到的溢价属于那个净值日，不是此刻。")
     bench = (base or {}).get(code)
     if bench is None:
         line += (f" 台账样本不足 {dp.LEDGER_PREM_MIN} 天，暂按绝对阈值 "
                  f"{dp.PREMIUM_WARN:g}% / {dp.PREMIUM_HEAVY:g}% 提示。")
     else:
         line += (f" 已用本品种最近 {dp.LEDGER_PREM_WINDOW} 天中位数 {bench:.2f}% 作基准，"
-                 f"偏离 +{dp.PREMIUM_DEV_WARN:g}% 起提示。")
+                 f"偏离 +{dp.PREMIUM_DEV_WARN:g}% 起提示、"
+                 f"+{dp.PREMIUM_DEV_HEAVY:g}% 加 ⚠。")
     st.caption(line)
 
 
 def render_detail(code, ev, base):
     signal = ev["signal"]
     st.markdown(
-        f'<div class="{card_class(signal)}">{dp.SIGNAL_ICONS.get(signal, "⚪")} {signal}</div>',
+        f'<div class="{card_class(signal)}">{dp.signal_icon(signal)} {signal}</div>',
         unsafe_allow_html=True,
     )
     st.markdown(f'<div class="reason-text">{plain_reason(ev)}</div>', unsafe_allow_html=True)
@@ -341,7 +359,9 @@ with st.expander("操作提醒"):
 - **这里没有买卖指令。** 金叉 / 死叉 / 持有观望 / 偏空观望都是对行情的描述，不是让你买或卖的结论。
 - **金叉死叉只是标记。** 30 只 ETF、22260 个观测的回测里，金叉和死叉之后 5/10/20 个交易日的超额收益都接近 0；照它交易等于付手续费做随机。
 - **长期↓ 是排除器，不是做空信号。** 加入 MA200 缓冲带的回测把最大回撤从 19.1% 压到 18.4%，但上涨捕获率恒等于持仓率——它只帮你别在长期下跌里硬扛，不负责赚钱。
-- **溢价是你为「买得到」多付的钱。** 跨境 ETF 常年溢价，溢价 12% 意味着净值要先涨 12% 你才回本。本页在台账样本不足 {dp.LEDGER_PREM_MIN} 天时用绝对阈值（{dp.PREMIUM_WARN:g}% / {dp.PREMIUM_HEAVY:g}%），攒够后改用「本品种最近 {dp.LEDGER_PREM_WINDOW} 天中位数 + 偏离量」。
+- **溢价是你为「买得到」多付的钱。** 跨境 ETF 常年溢价，溢价 12% 意味着净值要先涨 12% 你才回本。这里的溢价 =「净值日当天收盘 / 单位净值 − 1」，而净值本身滞后 1–2 天（跨境 T+2），价格却一直在动——所以括号里那个日期是它的口径，它不是你此刻看到的溢价。
+- **溢价阈值随品种浮动。** 同一条 12% 对 159941 可能天天触发（它常年就是 10% 上下），对 510300 却几乎不出现。台账里该品种攒够 {dp.LEDGER_PREM_MIN} 个观测后，改用「本品种最近 {dp.LEDGER_PREM_WINDOW} 天中位数 + 偏离量」判轻重；不够才退回绝对阈值（{dp.PREMIUM_WARN:g}% / {dp.PREMIUM_HEAVY:g}%）。
+- **「（N 日前）」是回看窗口。** 交叉当天没看到、隔一天再看，信号仍然显示，同时标明它距今天几个交易日；超过 5 个交易日的旧交叉不再提示——那已经是历史，不是状态变化。
 - **仓位和止损由你自己定。** 这里不给任何固定比例——没有证据支持某条比例更好，而单只 ETF 能承受多大回撤，只有你自己知道。
 - 自选列表保存在当前浏览器会话里，关掉就没了。
 """)
