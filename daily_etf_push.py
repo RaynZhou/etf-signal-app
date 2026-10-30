@@ -639,9 +639,132 @@ def fetch_data(symbol, max_retries=2):
     return None
 
 
+def prem_flag(prem, base=None):
+    """溢价是否该提示：'' / 'warn' / 'heavy'
+
+    有台账中位数就按「本品种中位数 + 偏离量」判，没有才退回绝对阈值。
+    抽成函数是为了让 app 和推送用同一条线——两边各写一遍阈值，早晚会分叉。
+    """
+    if prem is None:
+        return ""
+    if base is None:
+        warn, heavy = PREMIUM_WARN, PREMIUM_HEAVY
+    else:
+        warn = base + PREMIUM_DEV_WARN
+        heavy = base + PREMIUM_DEV_HEAVY
+    if prem >= heavy:
+        return "heavy"
+    if prem >= warn:
+        return "warn"
+    return ""
+
+
+def evaluate_df(df, show_long=True):
+    """从日线序列算出全部指标与信号。不取数、不渲染、不联网
+
+    这是推送和 app 的唯一口径来源。app 以前自己用简单移动平均算 RSI，
+    同一只 159941 在 2026-10-29 算出 34.3，推送给出 48.6，差 14 个点，
+    还拿这个数去过滤金叉。现在两边都调这个函数，口径不可能再分叉。
+
+    数据不足（少于 MIN_BARS 根）返回 None。MIN_BARS 必须 > 60：判金叉要比较
+    前一根和当前根的 MA60，只有 60 根时前一根的 MA60 还是 NaN，比较恒为 False。
+    """
+    if df is None or len(df) < MIN_BARS:
+        return None
+
+    # 场外基金给的是「单位净值/净值日期」，统一成「收盘/日期」，下游不用分两套
+    if "收盘" not in df.columns and "单位净值" in df.columns:
+        df = df.rename(columns={"单位净值": "收盘"})
+    if "日期" not in df.columns and "净值日期" in df.columns:
+        df = df.rename(columns={"净值日期": "日期"})
+    df = df[["日期", "收盘"]].sort_values("日期").reset_index(drop=True)
+
+    df["MA20"] = df["收盘"].rolling(20).mean()
+    df["MA60"] = df["收盘"].rolling(60).mean()
+    df["RSI"] = calculate_rsi(df["收盘"], 14)
+
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+    golden = bool(prev["MA20"] <= prev["MA60"]) and bool(latest["MA20"] > latest["MA60"])
+    death = bool(prev["MA20"] >= prev["MA60"]) and bool(latest["MA20"] < latest["MA60"])
+    # 持平算「不偏空」：连续横盘（债基净值天天一个价）会让 MA20 和 MA60 完全相等，
+    # 用严格大于会把这种行情印成「偏空观望」——凭空给了方向，而它其实没有
+    ma20_above = bool(latest["MA20"] >= latest["MA60"])
+
+    # 连续横盘会让 avg_gain / avg_loss 都为 0，得 NaN（债基净值很常见）。
+    # NaN 无法参与大小比较，显式转成 None，展示时印成 "--" 而不是 "nan"
+    raw_rsi = float(latest["RSI"])
+    rsi = round(raw_rsi, 1) if raw_rsi == raw_rsi else None
+
+    event = "golden" if golden else ("death" if death else "")
+    return {
+        "df": df,
+        "bar_date": str(latest["日期"])[:10],
+        "close": float(latest["收盘"]),
+        "ma20": float(latest["MA20"]),
+        "ma60": float(latest["MA60"]),
+        "rsi": rsi,
+        "golden": golden,
+        "death": death,
+        "ma20_above": ma20_above,
+        "event": event,
+        "signal": signal_label(event, ma20_above),
+        "long": calc_long_trend(df) if show_long else None,
+    }
+
+
+def evaluate(symbol, now, spot_prices=None, use_spot=False, fund_snap=None,
+             show_long=True):
+    """取数 + 补当日价 + 算指标，推送和 app 共用这一个入口
+
+    返回 dict；ok=False 时只有 reason 有意义。溢价原样带出（prem / nav_date），
+    要不要提示、要不要加⚠交给 prem_flag 判——阈值属于展示决策，不该混进取数。
+    溢价基准（台账中位数）也不在这里处理：同一个数字在「有基准」和「无基准」
+    两种情形下的含义不同，取数层不该知道台账长什么样。
+
+    补价规则：历史最后一根早于今天才补，且相对上一根变动超过 SPOT_JUMP_LIMIT
+    就不补。前复权价和未复权实时价混拼会造出一根假跳空，宁可退回上一交易日信号。
+    """
+    import pandas as pd
+    spot_prices = spot_prices or {}
+    df = fetch_data(symbol)
+    if df is None:
+        return {"ok": False, "reason": "取不到行情"}
+
+    if "收盘" not in df.columns and "单位净值" in df.columns:
+        df = df.rename(columns={"单位净值": "收盘"})
+    if "日期" not in df.columns and "净值日期" in df.columns:
+        df = df.rename(columns={"净值日期": "日期"})
+    df = df[["日期", "收盘"]].sort_values("日期").reset_index(drop=True)
+
+    today = now.strftime("%Y-%m-%d")
+    patched = False
+    if use_spot and len(df) and symbol in spot_prices \
+            and str(df.iloc[-1]["日期"])[:10] < today:
+        last_close = float(df.iloc[-1]["收盘"])
+        spot_price = spot_prices[symbol]
+        if last_close > 0 and abs(spot_price / last_close - 1) > SPOT_JUMP_LIMIT:
+            print(f"[提示] {symbol} 实时价 {spot_price} 相对上一根 {last_close} "
+                  f"变动超过 {SPOT_JUMP_LIMIT:.0%}，疑似折算/除权，不补价")
+        else:
+            df = pd.concat(
+                [df, pd.DataFrame([{"日期": today, "收盘": spot_price}])],
+                ignore_index=True,
+            )
+            patched = True
+
+    ev = evaluate_df(df, show_long)
+    if ev is None:
+        return {"ok": False, "reason": "数据不足"}
+    ev["ok"] = True
+    ev["patched"] = patched
+    ev["prem"], ev["nav_date"] = (fund_snap or {}).get(symbol, (None, ""))
+    return ev
+
+
 def analyze_one(symbol, now, spot_prices, use_spot=True, fund_snap=None,
                 show_long=True, prem_base=None):
-    """分析单只，返回 (展示文本, 数据基准日, 是否用了当日实时价, 结构化数据)
+    """分析单只，返回 (展示文本, 数据基准日 MM-DD, 是否用了当日实时价, 结构化数据)
 
     数据基准日形如 '10-28'，用来暴露"东财历史日线当天还没收录当日K线"这种情况；
     此时若 use_spot 为真，会用实时价补一根当日K线。基准日后面跟什么由 bar_suffix
@@ -655,83 +778,31 @@ def analyze_one(symbol, now, spot_prices, use_spot=True, fund_snap=None,
     有它就用「中位数 + 偏离量」判定，没它就用绝对阈值兜底。
     """
     try:
-        import pandas as pd
-        df = fetch_data(symbol)
-        if df is None or len(df) < MIN_BARS:
-            return f"- ⚪ **{symbol}** 数据不足", "", False, None
+        ev = evaluate(symbol, now, spot_prices, use_spot, fund_snap, show_long)
+        if not ev["ok"]:
+            if ev["reason"] == "数据不足":
+                return f"- ⚪ **{symbol}** 数据不足", "", False, None
+            label = f"{symbol} {FUND_NAMES[symbol]}" if symbol in FUND_NAMES else symbol
+            return f"- ❌ **{label}** 分析失败", "", False, None
 
-        # 统一列名处理
-        if "收盘" not in df.columns and "单位净值" in df.columns:
-            df = df.rename(columns={"单位净值": "收盘"})
-        if "日期" not in df.columns and "净值日期" in df.columns:
-            df = df.rename(columns={"净值日期": "日期"})
+        # 指标、信号、长期趋势全在 evaluate 里算好，这里只取
+        bar_date = ev["bar_date"]
+        rsi = ev["rsi"]
+        event = ev["event"]
+        signal = ev["signal"]
+        long_state = ev["long"]
 
-        df = df[["日期", "收盘"]].sort_values("日期").reset_index(drop=True)
-
-        today = now.strftime("%Y-%m-%d")
-        patched = False
-        if use_spot and str(df.iloc[-1]["日期"])[:10] < today and symbol in spot_prices:
-            last_close = float(df.iloc[-1]["收盘"])
-            spot_price = spot_prices[symbol]
-            if last_close > 0 and abs(spot_price / last_close - 1) > SPOT_JUMP_LIMIT:
-                # 宁可少一根当日K线（退回上一交易日信号），也不要拿口径不一致的价算出假买卖点
-                print(f"[提示] {symbol} 实时价 {spot_price} 相对上一根 {last_close} "
-                      f"变动超过 {SPOT_JUMP_LIMIT:.0%}，疑似折算/除权，不补价")
-            else:
-                df = pd.concat(
-                    [df, pd.DataFrame([{"日期": today, "收盘": spot_price}])],
-                    ignore_index=True,
-                )
-                patched = True
-
-        df["MA20"] = df["收盘"].rolling(20).mean()
-        df["MA60"] = df["收盘"].rolling(60).mean()
-        df["RSI"] = calculate_rsi(df["收盘"], 14)
-
-        latest = df.iloc[-1]
-        prev = df.iloc[-2]
-        bar_date = str(latest["日期"])[:10]
-
-        golden = (prev["MA20"] <= prev["MA60"]) and (latest["MA20"] > latest["MA60"])
-        death = (prev["MA20"] >= prev["MA60"]) and (latest["MA20"] < latest["MA60"])
-        ma20_above = latest["MA20"] > latest["MA60"]
-
-        # 连续横盘会让 avg_gain / avg_loss 都为 0，得 NaN（债基净值很常见）。
-        # NaN 无法参与大小比较，显式转成 None，展示时印成 "--" 而不是 "nan"
-        raw_rsi = float(latest["RSI"])
-        rsi = round(raw_rsi, 1) if raw_rsi == raw_rsi else None
-
-        # 交叉是「事件」，均线排列是「状态」，两者分开判定，避免标签自相矛盾。
-        # 文案怎么选、为什么叫金叉不叫买入信号，都在 signal_label 里说
-        event = "golden" if golden else ("death" if death else "")
-        signal = signal_label(event, ma20_above)
-
-        # 长期趋势（MA200 + 缓冲带）：给「历史回撤大」的品种做预警，不参与买卖判定
-        long_state = calc_long_trend(df) if show_long else None
-
-        # 溢价率只在明显时才印：常规 ETF 折溢价 1% 以内是噪音；
-        # QDII 常态就有 6~7%（额度限制），所以绝对阈值抬到 8%。
-        # 台账攒够 LEDGER_PREM_MIN 天后改用它自己最近 LEDGER_PREM_WINDOW 天的中位数：
-        # 溢价水平年年在漂，固定阈值必然不准（159941 的年度中位数从 2019 年的 -0.8%
-        # 涨到 2026 年的 6.8%）；全历史中位数会被旧样本拽住，同样不准。
-        # 净值日期必须能看出来：QDII 净值 T+2，今天看到的溢价对的是两三天前的净值，
-        # 不标出来容易被当成实时值（最初那个 15.1% 就是错配日期算出来的）
-        prem = None
+        # 溢价只在明显时才印，阈值判定在 prem_flag（app 用的是同一条线）
+        # 净值日期必须能看出来：QDII 净值 T+2，今天看到的溢价对的是两三天前的净值
+        prem = ev["prem"]
         prem_text = ""
-        if fund_snap and symbol in fund_snap:
-            prem, nav_date = fund_snap[symbol]
-            base = (prem_base or {}).get(symbol)
-            if base is None:
-                warn, heavy = PREMIUM_WARN, PREMIUM_HEAVY
-            else:
-                warn = base + PREMIUM_DEV_WARN
-                heavy = base + PREMIUM_DEV_HEAVY
-            if prem >= warn:
-                prem_text = f"溢价 {prem:.1f}%"
-                if nav_date and nav_date != now.strftime("%Y-%m-%d"):
-                    prem_text += f"({nav_date[5:]})"
-                if prem >= heavy:
-                    prem_text += "⚠"
+        level = prem_flag(prem, (prem_base or {}).get(symbol))
+        if level:
+            prem_text = f"溢价 {prem:.1f}%"
+            if ev["nav_date"] and ev["nav_date"] != now.strftime("%Y-%m-%d"):
+                prem_text += f"({ev['nav_date'][5:]})"
+            if level == "heavy":
+                prem_text += "⚠"
 
         # Markdown 列表项：- 图标 **代码** 产品名 · 信号 · RSI · 长期 · 溢价 · 基准日
         # 名称紧跟代码、用空格隔开（不拿 · 隔，否则一行被切成太多块反而难读）
@@ -758,13 +829,13 @@ def analyze_one(symbol, now, spot_prices, use_spot=True, fund_snap=None,
             "signal": signal,
             "event": event,
             "long": long_state,
-            "close": float(latest["收盘"]),
+            "close": ev["close"],
             "prem": prem,
             "bar_date": bar_date,
-            "dates": [str(d)[:10] for d in df["日期"]],
-            "closes": [float(v) for v in df["收盘"]],
+            "dates": [str(d)[:10] for d in ev["df"]["日期"]],
+            "closes": [float(v) for v in ev["df"]["收盘"]],
         }
-        return " · ".join(parts), bar_date[5:], patched, meta
+        return " · ".join(parts), bar_date[5:], ev["patched"], meta
     except Exception as e:
         print(f"[警告] {symbol} 分析失败: {e}")
         label = f"{symbol} {FUND_NAMES[symbol]}" if symbol in FUND_NAMES else symbol
