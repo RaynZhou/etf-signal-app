@@ -178,11 +178,32 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like 
 # 关键：单个换行在 Markdown 里等于空格，所以必须用列表项 / 空行才能真分行，
 # 改成纯文本拼 \n 会全部挤成一堆。以后改这里请继续用 "- " 列表。
 SIGNAL_ICONS = {
-    "买入信号": "🟢",
-    "卖出/减仓": "🔴",
+    "金叉": "🟢",
+    "死叉": "🔴",
     "偏空观望": "🟡",
     "持有/观望": "🔵",
 }
+
+# 事件 → 展示文案。30 只 22260 个观测的回测说金叉/死叉对后续涨跌没有稳定预测力
+# （超额≈0），所以这里印「金叉」而不是「买入信号」：后者等于替它承诺一件证据
+# 不支持的事，还和尾注「它只是标记，不是买卖指令」正面打架。
+# 台账里的 sig 仍存 golden/death，结算口径与展示文案无关。
+EVENT_LABELS = {"golden": "金叉", "death": "死叉"}
+
+
+def signal_label(event, ma20_above):
+    """事件优先于状态：当天有交叉就印交叉，否则按均线排列给状态
+
+    两者分开判定，避免「持有/观望 · 金叉」这种自相矛盾的组合。
+    RSI 刻意不参与：回测显示按 RSI 高低拦信号会让结果更差，而且一旦
+    「过滤了但仍印金叉」，标签又会矛盾。RSI 只当参考数字一起发。
+
+    抽成独立函数是为了能被测到：之前这段直接写在 analyze_one 里，
+    测试只能拿 stub 自造的字符串去断言，改回「买入信号」竟然测不出来。
+    """
+    if event in EVENT_LABELS:
+        return EVENT_LABELS[event]
+    return "持有/观望" if ma20_above else "偏空观望"
 
 
 # ==================== 时间工具 ====================
@@ -681,19 +702,9 @@ def analyze_one(symbol, now, spot_prices, use_spot=True, fund_snap=None,
         rsi = round(raw_rsi, 1) if raw_rsi == raw_rsi else None
 
         # 交叉是「事件」，均线排列是「状态」，两者分开判定，避免标签自相矛盾。
-        # 这里刻意不加 RSI 过滤：回测显示按 RSI 高低拦信号会让结果更差，
-        # 而且一旦「过滤了但仍印金叉」，就会出现「持有/观望 · 金叉」这种自相矛盾的消息。
-        # 现在信号和标记永远一致，RSI 只当参考数字一起发出去。
-        extra = ""
-        event = ""
-        if golden:
-            signal, extra, event = "买入信号", "金叉", "golden"
-        elif death:
-            signal, extra, event = "卖出/减仓", "死叉", "death"
-        elif ma20_above:
-            signal = "持有/观望"
-        else:
-            signal = "偏空观望"
+        # 文案怎么选、为什么叫金叉不叫买入信号，都在 signal_label 里说
+        event = "golden" if golden else ("death" if death else "")
+        signal = signal_label(event, ma20_above)
 
         # 长期趋势（MA200 + 缓冲带）：给「历史回撤大」的品种做预警，不参与买卖判定
         long_state = calc_long_trend(df) if show_long else None
@@ -730,9 +741,7 @@ def analyze_one(symbol, now, spot_prices, use_spot=True, fund_snap=None,
         name = FUND_NAMES.get(symbol, "")
         if name:
             head += f" {name}"
-        parts = [head, signal, rsi_text]
-        if extra:
-            parts.append(f"**{extra}**")
+        parts = [head, f"**{signal}**" if event else signal, rsi_text]
         if long_state == 1:
             parts.append("长期↑")
         elif long_state == 0:
