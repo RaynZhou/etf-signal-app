@@ -774,7 +774,7 @@ def analyze_one(symbol, now, spot_prices, use_spot=True, fund_snap=None,
 # ==================== 信号台账（实盘胜率） ====================
 # 为什么需要落盘：Actions 每次跑都是全新容器，不存就永远是「第一次」
 # 台账结构（紧凑键名，控制文件体积）：
-#   {"version":1, "start":"摘要日", "days": {"2026-10-30": {"159941": {"c":价, "sig":事件, "long":状态, "prem":溢价}}}}
+#   {"version":1, "start":"摘要日", "days": {"2026-10-30": {"159941": {"sig":事件, "long":状态, "prem":溢价}}}}
 
 def load_ledger():
     """读台账；文件不存在或损坏都当空台账——宁可丢胜率，不能让推送发不出去"""
@@ -845,6 +845,11 @@ def record_ledger(ledger, bar_date, metas):
     「持有/观望」每天都成立，存下来没有验证价值，只会把文件撑大。
     长期趋势和溢价率每天存一份，几个月后就能拿它们做时间序列分析，
     这正是这次「先观测几个月」的数据基础。
+
+    不记收盘价：前复权价会随分红除权整体重算，当年记下的价格和今天查到的
+    同一天价格对不上，会凭空多出涨跌幅（verify_ledger 里也是只在同一条序列
+    内部比）。既然不能用来对账，那它就是个死字段——写进去、没人读、还容易
+    让后来人以为能拿它算收益。老台账里的 c 字段留着不动，读的时候不看就行。
     """
     if not bar_date:
         return 0
@@ -853,7 +858,6 @@ def record_ledger(ledger, bar_date, metas):
         if not meta:
             continue
         day[meta["code"]] = {
-            "c": round(meta["close"], 4),
             "sig": meta["event"],
             "long": meta["long"],
             "prem": meta["prem"],
