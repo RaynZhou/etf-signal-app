@@ -221,6 +221,36 @@ def is_trade_day(now):
         return True
 
 
+# A股 15:00 收盘：这之后当日的K线才定格，之前所有「当日」数字都是盘中瞬时值
+CLOSE_MINUTE = 15 * 60
+
+
+def bar_is_final(now):
+    """当日K线是否已定格（收盘后）
+
+    为什么不按 slot 判断：手动触发（manual）不在任何窗口里，但 18:07 手动跑的
+    当然是收盘数据、10:13 跑的不是。按钟点判对两种触发方式都成立。
+    """
+    return now.hour * 60 + now.minute >= CLOSE_MINUTE
+
+
+def bar_suffix(bar_date, now):
+    """日期列里该跟什么后缀：今天这根K线在收盘前要标「盘中」
+
+    上一版用「当日」表示「这个价是我用实时价补的」，于是同一个盘中快照会同时
+    出现两副样子：走腾讯兜底的 1 只带「当日」，走东财的 13 只不带——东财盘中
+    已经返回了当日那根未收盘K线，根本进不了补价分支。底部那句「标当日的是今日
+    实时价（1/14 只）」于是被读成「另外 13 只是昨天的数据」，而它们其实是今天
+    的半根。标记该回答「这根K线完不完整」，不是「它从哪个接口来」。
+    """
+    if not bar_date:
+        return ""
+    day = bar_date[5:]
+    if bar_date != now.strftime("%Y-%m-%d") or bar_is_final(now):
+        return day
+    return f"{day} 盘中"
+
+
 # ==================== 数据与指标 ====================
 def should_apply_spot(slot, now):
     """是否用实时价补当日K线
@@ -593,7 +623,8 @@ def analyze_one(symbol, now, spot_prices, use_spot=True, fund_snap=None,
     """分析单只，返回 (展示文本, 数据基准日, 是否用了当日实时价, 结构化数据)
 
     数据基准日形如 '10-28'，用来暴露"东财历史日线当天还没收录当日K线"这种情况；
-    此时若 use_spot 为真，会用实时价补一根当日K线，基准日后标“当日”。
+    此时若 use_spot 为真，会用实时价补一根当日K线。基准日后面跟什么由 bar_suffix
+    决定：今天这根在收盘前标「盘中」，收盘后只写日期、不再区分它是接口给的还是补的。
     返回的展示文本是 Markdown 列表项，供 Server酱 正文直接渲染。
 
     第 4 项给台账用（带了日期和收盘序列），展示层不需要它，失败时为 None。
@@ -709,8 +740,9 @@ def analyze_one(symbol, now, spot_prices, use_spot=True, fund_snap=None,
             parts.append("**长期↓**")
         if prem_text:
             parts.append(prem_text)
-        if bar_date:
-            parts.append(f"{bar_date[5:]} 当日" if patched else bar_date[5:])
+        suffix = bar_suffix(bar_date, now)
+        if suffix:
+            parts.append(suffix)
 
         meta = {
             "code": symbol,
@@ -990,15 +1022,16 @@ def build_message(now, slot, record=False):
                     g_ups += 1
                 elif meta.get("long") == 0:
                     g_downs += 1
-            # 当日数据有两条来路：历史接口自己收录了，或用实时价补了一根，
-            # 说明文案要能区分这两种，所以这里两个都统计
+            # 当日数据有两条来路：历史接口自己收录了，或用实时价补了一根。
+            # 对读者来说这区别没有意义（盘中都是瞬时值、盘后都是收盘价），
+            # 正文只按 bar_date 判断「是不是今天」，补价只进运行日志。
             if bar_date == today:
                 fresh_count += 1
+                if patched:
+                    patched_count += 1
             # 只有「本该能拿到当日却没拿到」才算异常；盘前不补价，拿到上一交易日数据是正常的
             if use_spot and bar_date and bar_date != today and not patched:
                 stale.append(code)
-            if patched:
-                patched_count += 1
             time.sleep(0.8)  # 避免请求过快
         # 本节尾行：哪个大类在走强，一眼能对比——这是你要的「看热门行业」那层
         # 分母跟池级宽度行同一口径：只算得出长期状态的只数，取不到数的不进分母。
@@ -1065,6 +1098,9 @@ def build_message(now, slot, record=False):
     lines.append("")
     notes = []
     total = len(ETF_LIST)
+    # 补价只留在运行日志里：排查数据源时有用，对读者没有信息量
+    if patched_count:
+        print(f"[数据] {patched_count}/{total} 只用实时价补了当日K线")
     if slot == "pre":
         notes.append("盘前时段，指标按上一交易日收盘计算")
     elif not fresh_count:
@@ -1073,11 +1109,14 @@ def build_message(now, slot, record=False):
     else:
         # 判据是基准日是不是今天，不是有没有补价：
         # 历史接口（含腾讯兜底）本身就有当日K线时 patched_count=0，但数据是当天的，
-        # 不能报“当日行情未取到”
-        if patched_count:
-            notes.append(f"标“当日”的是今日实时价（{patched_count}/{total} 只）")
+        # 不能报「当日行情未取到」
+        if bar_is_final(now):
+            notes.append(f"ETF 信号已含今日收盘数据（{fresh_count}/{total} 只）")
         else:
-            notes.append(f"ETF 信号已含当日行情（{fresh_count}/{total} 只）")
+            # 盘中这根K线还没收盘，MA/RSI 每几分钟就变一次。上一版对此一字不提，
+            # 10:13 算出来的信号会被当成当天的定论。
+            notes.append(f"今日盘中数据（{fresh_count}/{total} 只），未收盘："
+                         "MA/RSI 会随价格变动")
         if stale:
             # 不区分“接口没给价”和“触发折算保护主动不补”，两种情况都去日志里看具体原因
             notes.append(f"⚠ 当日价未补齐：{name_list(stale)}（原因见运行日志）")
