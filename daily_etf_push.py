@@ -136,16 +136,21 @@ BAND_K = 0.5
 #
 # 所以分两档：台账里该品种的溢价记录不足 LEDGER_PREM_MIN 天时，用绝对阈值兜底；
 # 攒够了就改用它自己的中位数 + 偏离量，自动适应漂移。
+# 中位数只取最近 LEDGER_PREM_WINDOW 天：全历史中位数会被旧样本拽住，在单边漂移下
+# 反而比固定阈值更误导（推导见 calc_prem_baseline 的 docstring）。
 PREMIUM_WARN = 8.0
 PREMIUM_HEAVY = 12.0
 PREMIUM_DEV_WARN = 4.0
 PREMIUM_DEV_HEAVY = 7.0
 LEDGER_PREM_MIN = 20
+LEDGER_PREM_WINDOW = 60      # 溢价基准只回看最近这么多天，避免被多年前的水平拽住
 
 # 信号台账（跨天累计，用来统计实盘胜率）
 # Actions 每次跑都是全新容器，状态必须落到仓库文件里，由 workflow 结束后提交回去。
 LEDGER_PATH = os.getenv("ETF_LEDGER", "signals.json")
 LEDGER_FORWARD = (5, 10, 20)   # 信号发出后第几个交易日结算一次
+LEDGER_MIN_SAMPLE = 10         # 结算样本少于此数只报笔数、不出胜率
+LEDGER_STALE_BARS = 2          # 台账落后超过这么多个交易日就告警（漏一天算常态，连续漏才说明回写挂了）
 LEDGER_KEEP_DAYS = 260         # 台账只留最近这么多天，防止无限增长
 
 # RSI 分区线：只给 backtest.py 做分组对比，线上推送不做任何 RSI 过滤
@@ -664,8 +669,9 @@ def analyze_one(symbol, now, spot_prices, use_spot=True, fund_snap=None,
 
         # 溢价率只在明显时才印：常规 ETF 折溢价 1% 以内是噪音；
         # QDII 常态就有 6~7%（额度限制），所以绝对阈值抬到 8%。
-        # 台账攒够 LEDGER_PREM_MIN 天后改用它自己的中位数：溢价水平年年在漂，
-        # 固定阈值必然不准（159941 的年度中位数从 2019 年的 -0.8% 涨到 2026 年的 6.8%）。
+        # 台账攒够 LEDGER_PREM_MIN 天后改用它自己最近 LEDGER_PREM_WINDOW 天的中位数：
+        # 溢价水平年年在漂，固定阈值必然不准（159941 的年度中位数从 2019 年的 -0.8%
+        # 涨到 2026 年的 6.8%）；全历史中位数会被旧样本拽住，同样不准。
         # 净值日期必须能看出来：QDII 净值 T+2，今天看到的溢价对的是两三天前的净值，
         # 不标出来容易被当成实时值（最初那个 15.1% 就是错配日期算出来的）
         prem = None
@@ -763,21 +769,29 @@ def save_ledger(ledger):
 
 
 def calc_prem_baseline(ledger):
-    """从台账里取每只的溢价率中位数，样本不够 LEDGER_PREM_MIN 天的不给基准
+    """取每只最近 LEDGER_PREM_WINDOW 个台账日的溢价中位数，样本不足 LEDGER_PREM_MIN 天的不给基准
 
     为什么不信固定阈值：159941 的年度溢价中位数 2019 年是 -0.82%，2026 年是 +6.80%，
     差出七个多点。拿一个写死的数当尺子，过两年必然失效。
-    等台账自己攒出几十天，用该品种当时的中位数当基准才跟得上漂移。
+
+    为什么也不是全历史中位数（上一版就是这么写的，注释还写着「才跟得上漂移」，方向正好相反）：
+    中位数不会被漂移带过去，它会被旧样本拽住。假设溢价中枢从 0% 抬到 8%，台账前 240 天
+    记 0、最近 60 天记 8——全历史中位数仍是 0，于是「今天的 8%」被算成偏离基准 8 个点，
+    天天报⚠；中枢下移时反过来，旧的高值把基准抬住，该报的漏报。
+    漂移越慢危害越大，因为每一条单独看都像「今天有点高」，几乎不像异常。
+    取最近 60 天：够长能压住日常噪音，又不让三年前的水平参与决定今天的阈值。
     """
     hist = {}
-    for rec in (ledger.get("days") or {}).values():
+    # 按日期升序遍历：只有这样「取最近 N 天」才真是最近的。台账 dump 用了 sort_keys=True，
+    # 读回来的顺序大概率已经是日期序，但这里不依赖那个隐式前提。
+    for _day, rec in sorted((ledger.get("days") or {}).items()):
         for code, item in rec.items():
             value = item.get("prem")
             if value is None:
                 continue
             hist.setdefault(code, []).append(float(value))
     return {
-        code: statistics.median(vals)
+        code: statistics.median(vals[-LEDGER_PREM_WINDOW:])
         for code, vals in hist.items()
         if len(vals) >= LEDGER_PREM_MIN
     }
@@ -843,8 +857,39 @@ def verify_ledger(ledger, metas_by_code):
     return out
 
 
-def build_ledger_lines(ledger, stats):
-    """拼实盘胜率段落；样本不足时明确标出来，不让它看起来像个结论"""
+def ledger_staleness(ledger, metas_by_code):
+    """台账最后一天落后最新行情几个交易日；判断不了时返回 None
+
+    为什么用行情日期序列，而不是自然日或交易日历：
+      ① dates 本身就是交易所日历——节假日没有 K 线，不必另外拉取；
+      ② is_trade_day 拿不到日历时会退化成「周一至周五」，用它数天数会把长假算成正常；
+      ③ 这条检查的全部意义是「发现数据没写进去」，它自己不能再依赖一个可能失败的请求。
+
+    返回 None 的两种情况（都不告警）：台账为空；台账最后一天不在任何行情序列里
+    （那是脏数据、不是陈旧，硬报一个天数反而是误导）。
+    """
+    last = max((ledger.get("days") or {}), default=None)
+    if not last:
+        return None
+    # 取日期最长的那只当参照：它最可能覆盖台账里的最后一天
+    ref = max((m["dates"] for m in metas_by_code.values()
+               if m and m.get("dates")), key=len, default=None)
+    if not ref or last not in ref:
+        return None
+    return len(ref) - 1 - ref.index(last)
+
+
+def build_ledger_lines(ledger, stats, stale=None):
+    """拼实盘胜率段落；该 N 日样本不足 LEDGER_MIN_SAMPLE 笔时只报笔数
+
+    为什么要设门槛：原来「5日 1/1 胜 均+2.3%」和「5日 52/68 胜 均+0.4%」
+    在微信里排版一模一样——都是一行里跟着「胜 均」。但 1 笔的胜率没有信息量，
+    它就是那一天的涨跌，换个日期就能从 100% 翻到 0%，读的人却会当成「这套规则准」。
+    门槛以下只报笔数（N 日 M 笔），凑够了才谈胜率和均值。
+
+    stale 是台账落后最新行情几个交易日（见 ledger_staleness）。传 None 表示判断不了，
+    不告警——宁可漏报，不要把「不知道」印成一条假警报。
+    """
     days = ledger.get("days") or {}
     lines = ["### 📈 实盘验证", ""]
     if not days:
@@ -854,8 +899,15 @@ def build_ledger_lines(ledger, stats):
 
     start = ledger.get("start") or min(days)
     lines.append(f"- 自 {start[5:]} 起累计 {len(days)} 个交易日")
+    # 台账静默失败检查：workflow 里回写那步是 continue-on-error，重试失败就丢当天记录，
+    # 连丢几天也看不出来，直到发现胜率分母对不上。落后 0~2 天都是常态
+    # （盘中/盘后推送时台账本来就还是上一交易日的），超过才说明真丢了。
+    if stale is not None and stale > LEDGER_STALE_BARS:
+        lines.append(f"- ⚠️ 台账停在 {max(days)[5:]}，已落后 {stale} 个交易日"
+                     "——回写台账那步可能失败了，胜率分母会偏小")
 
-    has_stat = False
+    has_any = False     # 有已结算样本，哪怕只有 1 笔（下面文案要说"样本不足"而不是"没有"）
+    has_stat = False    # 有达到门槛的样本，才配叫胜率
     for sig, (name, direction) in LEDGER_DIRECTION.items():
         total = sum(1 for rec in days.values()
                     for code, item in rec.items() if item.get("sig") == sig)
@@ -867,16 +919,25 @@ def build_ledger_lines(ledger, stats):
             if not vals:
                 chunks.append(f"{n}日 待满")
                 continue
-            has_stat = True
+            has_any = True
             win = sum(1 for v in vals if v * direction > 0)
+            # 门槛逐 N 判定：5 日攒够了不代表 20 日也攒够，不能一刀切
+            if len(vals) < LEDGER_MIN_SAMPLE:
+                chunks.append(f"{n}日 {len(vals)}笔")
+                continue
+            has_stat = True
             mean = sum(vals) / len(vals) * 100
             chunks.append(f"{n}日 {win}/{len(vals)} 胜 均{mean:+.1f}%")
         lines.append(f"- **{name}** 发出 {total} 次 · " + " · ".join(chunks))
 
-    if not has_stat:
+    if not has_any:
         lines.append("- 暂无已结算样本，满 5 个交易日后出现胜率")
+    elif not has_stat:
+        lines.append(f"- 已结算样本不足 {LEDGER_MIN_SAMPLE} 笔，暂不出胜率"
+                     "（样本少时一两天就能把胜率翻面）")
     else:
-        lines.append("- 分子是已满 N 日的笔数；均值是实际涨跌，金叉后跌/死叉后涨都算输")
+        lines.append(f"- 满 {LEDGER_MIN_SAMPLE} 笔才出胜率；均值是实际涨跌，"
+                     "金叉后跌/死叉后涨都算输")
     lines.append("")
     return lines
 
@@ -897,7 +958,7 @@ def build_message(now, slot, record=False):
     ledger = load_ledger()
     prem_base = calc_prem_baseline(ledger)
     if prem_base:
-        print("[溢价] 已改用台账中位数作基准: " + "  ".join(
+        print(f"[溢价] 已改用台账最近 {LEDGER_PREM_WINDOW} 日中位数作基准: " + "  ".join(
             f"{k} {v:.2f}%" for k, v in sorted(prem_base.items())))
 
     # 推送标题栏已有“ETF信号助手·时段”，正文只留时间戳，不再重复一遍
@@ -994,7 +1055,8 @@ def build_message(now, slot, record=False):
         print(f"[台账] 当日K线未齐（{sorted(bar_dates) or '无'}），本次不记录")
 
     metas_by_code = {m["code"]: m for m in metas}
-    lines.extend(build_ledger_lines(ledger, verify_ledger(ledger, metas_by_code)))
+    lines.extend(build_ledger_lines(ledger, verify_ledger(ledger, metas_by_code),
+                                    ledger_staleness(ledger, metas_by_code)))
 
 
     # 数据来源说明，让消息里能看出算的是哪一天的价
