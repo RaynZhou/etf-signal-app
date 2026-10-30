@@ -7,15 +7,18 @@
 
 用法：
     python daily_etf_push.py --detect-slot   只判定当前北京时间落在哪个推送窗口，输出给 Actions
-    python daily_etf_push.py --slot close    按指定时段（pre / mid / close / manual）推送
+    python daily_etf_push.py --slot close    按指定时段（mid / close / manual）推送
     python daily_etf_push.py --slot mid --preview   只生成并打印消息，不发送（不占每日额度）
     python daily_etf_push.py --slot close --record  强制写入当日台账（本地补录用）
+    python daily_etf_push.py --backfill-prem 用历史净值回填溢价历史，让动态基准立刻生效
     python daily_etf_push.py                 按当前北京时间自动判定时段后推送
 
 台账：signals.json 记每天每只的信号/长期趋势/溢价率，用来算「从第一天推送开始」的实盘胜率。
      Actions 每次是全新容器，所以这个文件必须提交回仓库才有意义（见 workflow）。
 
-额度提醒：Server酱免费版每天只有 5 条，正常自动推送是一天 3 条，调试时优先用 --preview。
+# 额度提醒：Server酱免费版每天只有 5 条，正常自动推送是一天 2 条（盘中+盘后），
+# 调试时优先用 --preview。2026-10-30 砍掉了盘前那条：它取不到当日K线，
+# 内容与前一天盘后那条逐字相同，只是把同样的均线再发一遍（详见 SLOT_WINDOWS 注释）。
 """
 
 import os
@@ -26,6 +29,7 @@ import json
 import re
 import statistics
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
 # 防御：部分环境 stdout 不是 UTF-8（比如 Windows 下是 GBK），消息里的 emoji 会让 print 直接抛异常。
@@ -101,8 +105,14 @@ BEIJING_TZ = timezone(timedelta(hours=8))
 # 推送窗口：时段 → (标签, 窗口起点, 窗口终点)，均为北京时间
 # 每个窗口内 workflow 每 10 分钟触发一次，用来扛住 GitHub schedule 的延迟；
 # workflow 是「先占坑再推送」，所以同一时段只会真正发送一次，多出来的跳全部被 cache 挡掉
+#
+# 2026-10-30 砍掉「盘前」窗口（原 08:50-09:20）。理由不是额度不够，是它没有信息量：
+# 盘前拿不到当日K线（should_apply_spot 在盘前直接返回 False），所以盘前那条的
+# MA/RSI/长期状态与昨天盘后那条**逐字相同**，唯一差别是「盘前时段」四个字。
+# 等于每天 3 条里烧掉 1 条去复读上一条，占免费版 5 条的 20%。
+# 要恢复盘前推送，前提是先接一个真正有增量的数据源（隔夜美股、港股夜期、外盘期货），
+# 而不是把昨天的均线再发一遍。在那之前这里不保留 pre。
 SLOT_WINDOWS = {
-    "pre": ("盘前", (8, 50), (9, 20)),
     "mid": ("盘中", (11, 0), (11, 30)),
     "close": ("盘后", (15, 20), (15, 50)),
 }
@@ -142,8 +152,13 @@ PREMIUM_WARN = 8.0
 PREMIUM_HEAVY = 12.0
 PREMIUM_DEV_WARN = 4.0
 PREMIUM_DEV_HEAVY = 7.0
-LEDGER_PREM_MIN = 20
+# 启用门槛从 20 提到 40：台账每天只贡献 1 个样本，20 个样本的中位数极不稳定
+# （插进两三个极端值就能拽走两三个点），40 个才勉强能当尺子用。窗口仍是 60，
+# 所以第 40-60 天是稳定区，第 20-40 天那种「已启用但样本不足」的模糊地带被绕开了。
+LEDGER_PREM_MIN = 40
 LEDGER_PREM_WINDOW = 60      # 溢价基准只回看最近这么多天，避免被多年前的水平拽住
+# 回填的溢价历史保留天数：比窗口多留 30 天，方便以后换窗口时不必重拉
+PREM_HIST_KEEP = LEDGER_PREM_WINDOW + 30
 
 # 信号台账（跨天累计，用来统计实盘胜率）
 # Actions 每次跑都是全新容器，状态必须落到仓库文件里，由 workflow 结束后提交回去。
@@ -152,6 +167,14 @@ LEDGER_FORWARD = (5, 10, 20)   # 信号发出后第几个交易日结算一次
 LEDGER_MIN_SAMPLE = 10         # 结算样本少于此数只报笔数、不出胜率
 LEDGER_STALE_BARS = 2          # 台账落后超过这么多个交易日就告警（漏一天算常态，连续漏才说明回写挂了）
 LEDGER_KEEP_DAYS = 260         # 台账只留最近这么多天，防止无限增长
+
+# 事件回看窗口：金叉/死叉原先只比对「最后两根」，跨日的事件就会凭空消失。
+# 2026-10-30 实测：513120 在 3 个交易日前交叉、515220 在 6 个交易日前交叉，
+# 而当天推送 event 为空，读者看到「偏空观望」，完全不知道刚发生过什么。
+# 更隐蔽的后果在台账：record 只记当天的 event，所以推送漏发那天（占坑失败、网络失败、
+# Actions 挂掉）的交叉永久消失——「实盘胜率」的样本天然只含推送成功那天的交叉，这是选择偏差。
+# 回看 5 个交易日：覆盖一个完整交易周，又不至于把早已走完的交叉翻出来当新闻。
+EVENT_LOOKBACK = 5
 
 # RSI 分区线：只给 backtest.py 做分组对比，线上推送不做任何 RSI 过滤
 # 2026-10-29 回测（1932 个观测、400 天前复权日线）：
@@ -184,6 +207,20 @@ SIGNAL_ICONS = {
     "持有/观望": "🔵",
 }
 
+
+def signal_icon(signal):
+    """按前缀取图标
+
+    加了回看窗口之后，signal 会出现「金叉（3日前）」这种带后缀的形态。
+    用 SIGNAL_ICONS.get(signal) 精确匹配会掉成 ⚪——图标说「无信号」而文字说「金叉」，
+    比没有图标更糟。所以统一走前缀匹配。
+    """
+    for key, icon in SIGNAL_ICONS.items():
+        if signal.startswith(key):
+            return icon
+    return "⚪"
+
+
 # 事件 → 展示文案。30 只 22260 个观测的回测说金叉/死叉对后续涨跌没有稳定预测力
 # （超额≈0），所以这里印「金叉」而不是「买入信号」：后者等于替它承诺一件证据
 # 不支持的事，还和尾注「它只是标记，不是买卖指令」正面打架。
@@ -191,18 +228,23 @@ SIGNAL_ICONS = {
 EVENT_LABELS = {"golden": "金叉", "death": "死叉"}
 
 
-def signal_label(event, ma20_above):
-    """事件优先于状态：当天有交叉就印交叉，否则按均线排列给状态
+def signal_label(event, ma20_above, days_ago=0):
+    """事件优先于状态：回看窗口内有交叉就印交叉，否则按均线排列给状态
 
     两者分开判定，避免「持有/观望 · 金叉」这种自相矛盾的组合。
     RSI 刻意不参与：回测显示按 RSI 高低拦信号会让结果更差，而且一旦
     「过滤了但仍印金叉」，标签又会矛盾。RSI 只当参考数字一起发。
 
+    days_ago 是交叉距今天几个交易日（0 = 今天）。非 0 时必须标出来：
+    直接印「金叉」会让人以为是今天发生的，而它可能是 4 个交易日前那根，
+    中间的价格早就走完了——这正是金叉证伪结论里说的「滞后性」。
+
     抽成独立函数是为了能被测到：之前这段直接写在 analyze_one 里，
     测试只能拿 stub 自造的字符串去断言，改回「买入信号」竟然测不出来。
     """
     if event in EVENT_LABELS:
-        return EVENT_LABELS[event]
+        label = EVENT_LABELS[event]
+        return label if not days_ago else f"{label}（{days_ago}日前）"
     return "持有/观望" if ma20_above else "偏空观望"
 
 
@@ -276,12 +318,13 @@ def bar_suffix(bar_date, now):
 def should_apply_spot(slot, now):
     """是否用实时价补当日K线
 
-    盘前（未开盘）绝对不能补：那时实时接口的「最新价」就是昨收，
+    开盘前（未到 09:30）绝对不能补：那时实时接口的「最新价」就是昨收，
     补进去等于凭空多插一根平盘K线，会把 MA/RSI 算歪。
     盘中、盘后补：此时最新价是当日真实价格，15:20 那条才能算出当日信号。
+
+    盘前推送窗口已删，但这里不能跟着删：手动跑 --slot manual、或外部定时器
+    在 09:30 前误触发时，这里就是唯一一道拦下来不让实时价渗进来的门。
     """
-    if slot == "pre":
-        return False
     return now.hour * 60 + now.minute >= 9 * 60 + 30
 
 
@@ -465,9 +508,14 @@ def fetch_kline_tencent(symbol, count=HISTORY_DAYS, adjust=True):
     return pd.DataFrame(records)
 
 
-def fetch_close_on(symbol, date_str):
-    """取某一天的不复权收盘价，用于和净值对齐算溢价"""
-    df = fetch_kline_tencent(symbol, count=30, adjust=False)
+def fetch_close_on(symbol, date_str, count=90):
+    """取某一天的不复权收盘价，用于和净值对齐算溢价
+
+    count 从 30 提到 90：30 根只覆盖约 42 个日历日，QDII 净值滞后 2 天，
+    再遇上长假（国庆/春节休市 8 天）可能落到窗口外，那时溢价会静默消失而不是报错。
+    90 根约 130 个日历日，足够跨过任何一次长假。
+    """
+    df = fetch_kline_tencent(symbol, count=count, adjust=False)
     if df is None or df.empty:
         return None
     hit = df[df["日期"] == date_str]
@@ -476,10 +524,116 @@ def fetch_close_on(symbol, date_str):
     return float(hit.iloc[-1]["收盘"])
 
 
-def fetch_fund_snapshot(symbols):
-    """返回 {代码: (溢价率%, 净值日期)}，取不到的标的直接不进结果
+def fetch_nav_history(code, days=90):
+    """单只基金最近 days 天的历史单位净值，返回 {日期: 净值}（日期形如 2026-10-28）
 
-    溢价率 = 同日收盘 / 单位净值 - 1，正数表示溢价。
+    回填专用。为什么必须单独走这条路：fund_etf_fund_daily_em 只返回最近 2 列净值，
+    做得了「今天的溢价」但做不了「过去 60 天的溢价」；而 fund_open_fund_info_em
+    返回完整历史（实测 159941 有 2739 行、162411 有 3661 行），ETF 与 LOF 都覆盖。
+    这是让「动态溢价基准」不必空等 40 个交易日的唯一路径。
+    """
+    try:
+        import akshare as ak
+    except ImportError as e:
+        print(f"[提示] akshare 不可用，无法回填净值历史: {e}")
+        return {}
+
+    try:
+        df = ak.fund_open_fund_info_em(symbol=code, indicator="单位净值走势")
+    except Exception as e:
+        print(f"[提示] {code} 净值历史获取失败: {e}")
+        return {}
+    if df is None or df.empty:
+        return {}
+
+    date_col = next((c for c in ("净值日期", "日期") if c in df.columns), None)
+    nav_col = next((c for c in ("单位净值", "净值") if c in df.columns), None)
+    if not date_col or not nav_col:
+        print(f"[提示] {code} 净值历史列名不符，跳过；实际列: {list(df.columns)[:6]}")
+        return {}
+
+    out = {}
+    for _, row in df.tail(days + 40).iterrows():        # 多取一些再去掉非交易日
+        try:
+            d = str(row[date_col])[:10]
+            v = float(row[nav_col])
+        except (TypeError, ValueError):
+            continue
+        if v != v or v <= 0:
+            continue
+        out[d] = v
+    return dict(sorted(out.items())[-days:])
+
+
+def fetch_nav_batch(symbols):
+    """批量取「最近一个可用单位净值」，返回 {代码: (nav, 'YYYY-MM-DD')}
+
+    两个源，按「快但窄 → 慢但全」的顺序用：
+      ① fund_etf_fund_daily_em：一次拉全市场 ETF，但列名是日期透出的宽表，
+         只回最近两列净值。快，但不覆盖 LOF。
+      ② fund_open_fund_info_em：一次一只，返回完整历史，ETF 与 LOF 都覆盖。
+
+    为什么必须补上②：162411 华宝油气是 LOF，在①里根本不存在，
+    而它恰恰是全池最该看溢价的标的——LOF 折溢价本身就是套利核心。
+    2026-10-30 实测：14 只里①命中 13 只，唯一缺的就是 162411，
+    而旧代码只是不印溢价、不作任何提示，读者会以为它没有溢价问题。
+    """
+    wanted = list(dict.fromkeys(symbols))
+    out = {}
+
+    try:
+        import akshare as ak
+    except ImportError as e:
+        print(f"[提示] akshare 不可用，跳过溢价率: {e}")
+        return out
+
+    # ① 批量宽表
+    try:
+        wide = ak.fund_etf_fund_daily_em()
+    except Exception as e:
+        print(f"[提示] 溢价率批量源获取失败，改走逐只净值: {e}")
+        wide = None
+
+    if wide is not None and not wide.empty:
+        code_col = next((c for c in ("基金代码", "代码") if c in wide.columns), None)
+        nav_cols = sorted(
+            [c for c in wide.columns if re.match(r"^\d{4}-\d{2}-\d{2}-单位净值$", str(c))],
+            reverse=True,
+        )
+        if code_col and nav_cols:
+            wanted_set = set(wanted)
+            for _, row in wide.iterrows():
+                code = str(row[code_col]).strip()
+                if code not in wanted_set or code in out:
+                    continue
+                for col in nav_cols:
+                    try:
+                        value = float(row[col])
+                    except (TypeError, ValueError):
+                        continue
+                    if value != value or value <= 0:
+                        continue
+                    out[code] = (value, str(col)[:10])
+                    break
+        else:
+            print(f"[提示] 溢价率宽表列名与预期不符，改走逐只净值；实际列: {list(wide.columns)[:10]}")
+
+    # ② 逐只兜底（主要是 LOF）
+    missing = [c for c in wanted if c not in out]
+    for code in missing:
+        hist = fetch_nav_history(code, days=10)
+        if hist:
+            last_date = max(hist)
+            out[code] = (hist[last_date], last_date)
+            print(f"[溢价] {code} 不在 ETF 净值宽表里，已用单只净值兜底（{last_date}）")
+
+    return out
+
+
+def fetch_fund_snapshot(symbols, max_workers=6):
+    """返回 {代码: {"prem": 溢价率%, "label": 净值日 MM-DD, "nav_date": 完整日期}}
+
+    溢价率 = 同日收盘 / 单位净值 - 1，正数表示溢价。取不到的标的直接不进结果。
 
     这里踩过一个坑必须留在注释里：最初图省事，直接拿 fund_etf_fund_daily_em 的
     「市价」列除以「净值」列，159941 算出 15.1%。但那个接口的两列并不同期——
@@ -490,58 +644,39 @@ def fetch_fund_snapshot(symbols):
     价格还得用不复权（adjust=False）：基金净值是不复权的，拿前复权价比，
     分红会被抹掉，溢价会凭空变大。
 
-    为什么不用 fund_etf_spot_em：它在境外 runner 上实测 502（push2delay 域名）。
-    失败不响主流程：只是少一个提示，信号照常算。
+    为什么不用 fund_etf_spot_em 里的 IOPV 做「实时溢价」：
+    2026-10-30 实测该接口在国内网络下拉 16 页分页，第 6 页就 ProxyError；
+    GitHub runner 上更是长期 502。把一个「大部分时候取不到」的源塞进主链路，
+    只会让溢价时有时无、口径时实时时净值，比老实的 T-1 更误导。
+    所以这里明确只给净值口径，并让调用方把「这是哪天」印到消息里。
+
+    并发取收盘价：14 只串行要 23.5 秒（实测），而这一步不依赖顺序，
+    用线程池能压到 4-5 秒。东财/腾讯对并发 6 个请求没有表现出限流。
     """
-    try:
-        import akshare as ak
-    except ImportError as e:
-        print(f"[提示] akshare 不可用，跳过溢价率: {e}")
+    navs = fetch_nav_batch(symbols)
+    if not navs:
         return {}
 
-    try:
-        df = ak.fund_etf_fund_daily_em()
-    except Exception as e:
-        print(f"[提示] 溢价率数据获取失败: {e}")
-        return {}
-    if df is None or df.empty:
-        return {}
-
-    code_col = next((c for c in ("基金代码", "代码") if c in df.columns), None)
-    if not code_col:
-        print(f"[提示] 溢价率数据列名与预期不符，跳过；实际列: {list(df.columns)[:10]}")
-        return {}
-
-    # 列名形如 "2026-10-28-单位净值"，按日期倒序，取最近一个有值的
-    nav_cols = sorted(
-        [c for c in df.columns if re.match(r"^\d{4}-\d{2}-\d{2}-单位净值$", str(c))],
-        reverse=True,
-    )
-    if not nav_cols:
-        print("[提示] 未找到单位净值列，跳过溢价率")
-        return {}
-
-    wanted = set(symbols)
     out = {}
-    for _, row in df.iterrows():
-        code = str(row[code_col]).strip()
-        if code not in wanted:
-            continue
-        nav, nav_date = None, ""
-        for col in nav_cols:
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        pending = {pool.submit(fetch_close_on, code, nav_date): (code, nav, nav_date)
+                   for code, (nav, nav_date) in navs.items()}
+        for future in as_completed(pending):
+            code, nav, nav_date = pending[future]
             try:
-                value = float(row[col])
-            except (TypeError, ValueError):
+                close = future.result()
+            except Exception as e:
+                print(f"[提示] {code} 溢价对齐失败: {e}")
                 continue
-            if not math.isnan(value) and value > 0:
-                nav, nav_date = value, str(col)[:10]
-                break
-        if nav is None:
-            continue
-        close = fetch_close_on(code, nav_date)
-        if not close:
-            continue
-        out[code] = (round((close / nav - 1) * 100, 2), nav_date)
+            if not close:
+                # 净值日在 90 根K线之外（长期停牌等），这一只就当没有溢价，不要编一个
+                print(f"[提示] {code} 在 {nav_date} 没有不复权收盘价，跳过溢价")
+                continue
+            out[code] = {
+                "prem": round((close / nav - 1) * 100, 2),
+                "label": nav_date[5:],
+                "nav_date": nav_date,
+            }
     return out
 
 
@@ -595,11 +730,17 @@ def calculate_rsi(series, period=14):
 
 
 def fetch_data(symbol, max_retries=2):
-    """取历史日线，返回含「日期 / 收盘」的 DataFrame
+    """取历史日线，返回含「日期 / 收盘」的 DataFrame，df.attrs 里带数据源与根数
 
     场内 ETF 只用市价接口（东财 → 腾讯兜底），绝不退到场外净值接口：
     净值和市价是两套价格，跨境ETF长期高溢价，
     混进同一条序列算出的 MA/RSI 是错的（实测 159941 净值 1.4647 vs 市价 1.661）
+
+    为什么要把数据源写进 attrs：三条分支给出的窗口长度差得很远——实测同一批 14 只里
+    东财带日期是 400 根、东财不带日期是全历史（162411 拿到 3346 根）、腾讯是 601 根。
+    对单只标的的指标没影响（滞回递推会收敛），但任何跨标的比较都会因窗口不同而不可比。
+    而旧版的失败只在 stdout 打一行，消息里仍统一写「数据来源：东方财富 / 腾讯」，
+    读者无从判断某只到底走的哪条源。这个标签现在会一路带到推送底部。
     """
     import akshare as ak
     now = beijing_now()
@@ -609,20 +750,25 @@ def fetch_data(symbol, max_retries=2):
 
     if is_onexchange(symbol):
         attempts = [
-            lambda: ak.fund_etf_hist_em(symbol=symbol, period="daily",
-                                        start_date=start_date, end_date=end_date, adjust="qfq"),
-            lambda: ak.fund_etf_hist_em(symbol=symbol, period="daily", adjust="qfq"),
+            ("eastmoney-band", lambda: ak.fund_etf_hist_em(
+                symbol=symbol, period="daily",
+                start_date=start_date, end_date=end_date, adjust="qfq")),
+            ("eastmoney-full", lambda: ak.fund_etf_hist_em(
+                symbol=symbol, period="daily", adjust="qfq")),
         ]
     else:
         attempts = [
-            lambda: ak.fund_open_fund_info_em(symbol=symbol, indicator="单位净值走势"),
+            ("eastmoney-nav", lambda: ak.fund_open_fund_info_em(
+                symbol=symbol, indicator="单位净值走势")),
         ]
 
-    for call in attempts:
+    for source, call in attempts:
         for _attempt in range(max_retries):
             try:
                 df = call()
                 if df is not None and not df.empty:
+                    df.attrs["source"] = source
+                    df.attrs["bars"] = len(df)
                     return df
             except Exception as e:
                 last_error = e
@@ -632,6 +778,8 @@ def fetch_data(symbol, max_retries=2):
     if is_onexchange(symbol):
         df = fetch_kline_tencent(symbol)
         if df is not None:
+            df.attrs["source"] = "tencent"
+            df.attrs["bars"] = len(df)
             print(f"[提示] {symbol} 东财未返回行情，改用腾讯历史日线")
             return df
 
@@ -659,6 +807,37 @@ def prem_flag(prem, base=None):
     return ""
 
 
+def find_last_cross(df, lookback=EVENT_LOOKBACK):
+    """在最近 lookback+1 根K线里找最近一次 MA20/MA60 交叉
+
+    返回 (event, days_ago, 交叉日)；没有交叉返回 ("", None, "")。
+
+    判定式与原版「只看最后两根」逐字一致（prev<= 且 cur> 算金叉，prev>= 且 cur< 算死叉），
+    所以第 0 根的行为没有任何变化——向后扩展只是让 1~lookback 根前的交叉也能被看见。
+    持平（MA20 == MA60）时按原语义两边都能触发，债基连续横盘不会凭空产生事件。
+
+    为什么必须回看：金叉/死叉是「事件」不是「状态」，只在发生那一刻有信息。
+    只看最后两根意味着——如果推送在交叉当天没发出去（占坑失败/网络失败/手动跳过），
+    这个事件就永久消失了：后一天的推送不会提它，台账也不会记它。
+    “实盘胜率”的样本于是天然只含“推送成功那天发生的交叉”，这是选择偏差。
+    """
+    if df is None or len(df) < 2:
+        return "", None, ""
+    ma20, ma60 = df["MA20"], df["MA60"]
+    for k in range(0, min(lookback, len(df) - 1) + 1):
+        i = len(df) - 1 - k
+        if i < 1:
+            break
+        p20, p60 = ma20.iloc[i - 1], ma60.iloc[i - 1]
+        c20, c60 = ma20.iloc[i], ma60.iloc[i]
+        # NaN 参与比较恒为 False，暖机不足的早期下标会自动跳掉
+        if p20 <= p60 and c20 > c60:
+            return "golden", k, str(df["日期"].iloc[i])[:10]
+        if p20 >= p60 and c20 < c60:
+            return "death", k, str(df["日期"].iloc[i])[:10]
+    return "", None, ""
+
+
 def evaluate_df(df, show_long=True):
     """从日线序列算出全部指标与信号。不取数、不渲染、不联网
 
@@ -684,9 +863,6 @@ def evaluate_df(df, show_long=True):
     df["RSI"] = calculate_rsi(df["收盘"], 14)
 
     latest = df.iloc[-1]
-    prev = df.iloc[-2]
-    golden = bool(prev["MA20"] <= prev["MA60"]) and bool(latest["MA20"] > latest["MA60"])
-    death = bool(prev["MA20"] >= prev["MA60"]) and bool(latest["MA20"] < latest["MA60"])
     # 持平算「不偏空」：连续横盘（债基净值天天一个价）会让 MA20 和 MA60 完全相等，
     # 用严格大于会把这种行情印成「偏空观望」——凭空给了方向，而它其实没有
     ma20_above = bool(latest["MA20"] >= latest["MA60"])
@@ -696,7 +872,7 @@ def evaluate_df(df, show_long=True):
     raw_rsi = float(latest["RSI"])
     rsi = round(raw_rsi, 1) if raw_rsi == raw_rsi else None
 
-    event = "golden" if golden else ("death" if death else "")
+    event, event_days_ago, event_date = find_last_cross(df)
     return {
         "df": df,
         "bar_date": str(latest["日期"])[:10],
@@ -704,11 +880,15 @@ def evaluate_df(df, show_long=True):
         "ma20": float(latest["MA20"]),
         "ma60": float(latest["MA60"]),
         "rsi": rsi,
-        "golden": golden,
-        "death": death,
+        # golden/death 保留「当日交叉」的旧语义，供需要二值判断的地方用；
+        # 跨日事件走 event/event_days_ago，两者不要混用
+        "golden": event == "golden" and event_days_ago == 0,
+        "death": event == "death" and event_days_ago == 0,
         "ma20_above": ma20_above,
         "event": event,
-        "signal": signal_label(event, ma20_above),
+        "event_days_ago": event_days_ago,
+        "event_date": event_date,
+        "signal": signal_label(event, ma20_above, event_days_ago or 0),
         "long": calc_long_trend(df) if show_long else None,
     }
 
@@ -730,6 +910,10 @@ def evaluate(symbol, now, spot_prices=None, use_spot=False, fund_snap=None,
     df = fetch_data(symbol)
     if df is None:
         return {"ok": False, "reason": "取不到行情"}
+
+    # 必须在切片前读 attrs：df[["日期", "收盘"]] 之后 attrs 不保证跟着走
+    source = df.attrs.get("source", "")
+    bars = df.attrs.get("bars", 0)
 
     if "收盘" not in df.columns and "单位净值" in df.columns:
         df = df.rename(columns={"单位净值": "收盘"})
@@ -758,8 +942,36 @@ def evaluate(symbol, now, spot_prices=None, use_spot=False, fund_snap=None,
         return {"ok": False, "reason": "数据不足"}
     ev["ok"] = True
     ev["patched"] = patched
-    ev["prem"], ev["nav_date"] = (fund_snap or {}).get(symbol, (None, ""))
+    ev["source"] = source
+    ev["bars"] = bars
+    # 溢价是 dict 而不是 tuple 了：label 就是「这个溢价对应哪一天的净值」，
+    # 展示层必须把它印出来——同一个 14.5% 在净值日 T-1 和 T-5 下含义完全不同
+    snap = (fund_snap or {}).get(symbol) or {}
+    ev["prem"] = snap.get("prem")
+    ev["prem_label"] = snap.get("label") or ""
+    ev["prem_nav_date"] = snap.get("nav_date") or ""
     return ev
+
+
+# 数据源 → 展示名，用于推送底部那句「各只到底走的哪条源」
+SOURCE_NAMES = {
+    "eastmoney-band": "东财",
+    "eastmoney-full": "东财全历史",
+    "eastmoney-nav": "东财净值",
+    "tencent": "腾讯",
+    "": "未知",
+}
+
+
+def source_summary(sources):
+    """把数据源计数拼成一行：{source: n} → '东财 8 · 腾讯 6'"""
+    counts = {}
+    for s in sources:
+        counts[s] = counts.get(s, 0) + 1
+    if not counts:
+        return ""
+    return " · ".join(f"{SOURCE_NAMES.get(k, k)} {v}"
+                      for k, v in sorted(counts.items(), key=lambda kv: -kv[1]))
 
 
 def analyze_one(symbol, now, spot_prices, use_spot=True, fund_snap=None,
@@ -792,23 +1004,26 @@ def analyze_one(symbol, now, spot_prices, use_spot=True, fund_snap=None,
         signal = ev["signal"]
         long_state = ev["long"]
 
-        # 溢价只在明显时才印，阈值判定在 prem_flag（app 用的是同一条线）
-        # 净值日期必须能看出来：QDII 净值 T+2，今天看到的溢价对的是两三天前的净值
+        # 溢价只要取到就印，不再「不严重就不印」：不印的话读者无法区分
+        # 「没有溢价数据」和「溢价正常」，而溢价是这个模型唯一还有证据支持的维度。
+        # 阈值只决定加不加 ⚠——文字标签仍然是「净值日」，不是「此刻」。
+        # 159941 的动态基准中位是 11.55%，所以 14.5% 在它自己的尺度上只是偏高而非异常；
+        # 同期固定阈值（heavy 12%）会让它天天报⚠。
         prem = ev["prem"]
+        prem_label = ev["prem_label"]
         prem_text = ""
-        level = prem_flag(prem, (prem_base or {}).get(symbol))
-        if level:
+        if prem is not None:
             prem_text = f"溢价 {prem:.1f}%"
-            if ev["nav_date"] and ev["nav_date"] != now.strftime("%Y-%m-%d"):
-                prem_text += f"({ev['nav_date'][5:]})"
-            if level == "heavy":
+            if prem_label:
+                prem_text += f"({prem_label})"
+            if prem_flag(prem, (prem_base or {}).get(symbol)) == "heavy":
                 prem_text += "⚠"
 
         # Markdown 列表项：- 图标 **代码** 产品名 · 信号 · RSI · 长期 · 溢价 · 基准日
         # 名称紧跟代码、用空格隔开（不拿 · 隔，否则一行被切成太多块反而难读）
         # 当日标记直接用文字：全角＊在手机上渲染得太小看不清，半角 * 又会被 Markdown 当斜体
         rsi_text = f"RSI {rsi}" if rsi is not None else "RSI --"
-        head = f"- {SIGNAL_ICONS.get(signal, '⚪')} **{symbol}**"
+        head = f"- {signal_icon(signal)} **{symbol}**"
         name = FUND_NAMES.get(symbol, "")
         if name:
             head += f" {name}"
@@ -828,10 +1043,18 @@ def analyze_one(symbol, now, spot_prices, use_spot=True, fund_snap=None,
             "code": symbol,
             "signal": signal,
             "event": event,
+            # 交叉发生在哪一天、距今天几根：台账要靠它去重，展示靠它标「N日前」
+            "event_date": ev["event_date"],
+            "event_days_ago": ev["event_days_ago"],
             "long": long_state,
             "close": ev["close"],
             "prem": prem,
+            # 台账只存净值口径的 prem（基准是同一分布的中位数，混入口径就失效了）。
+            # 目前两者是同一个值；将来若接入实时溢价，这里就要保持净值口径不变。
+            "prem_nav": prem,
             "bar_date": bar_date,
+            "source": ev.get("source", ""),
+            "bars": ev.get("bars", 0),
             "dates": [str(d)[:10] for d in ev["df"]["日期"]],
             "closes": [float(v) for v in ev["df"]["收盘"]],
         }
@@ -868,6 +1091,17 @@ def save_ledger(ledger):
     if len(days) > LEDGER_KEEP_DAYS:
         ledger["days"] = {k: days[k] for k in sorted(days)[-LEDGER_KEEP_DAYS:]}
         print(f"[台账] 超过 {LEDGER_KEEP_DAYS} 天，已裁掉最早的记录")
+
+    # prem_hist 同样要裁：回填一次就是 90 天 × 14 只，不裁会无限长下去
+    hist = ledger.get("prem_hist")
+    if isinstance(hist, dict) and hist:
+        pruned = {}
+        for code, series in hist.items():
+            if not isinstance(series, dict):
+                continue
+            pruned[code] = {d: series[d] for d in sorted(series)[-PREM_HIST_KEEP:]}
+        ledger["prem_hist"] = pruned
+
     tmp = LEDGER_PATH + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
@@ -881,7 +1115,7 @@ def save_ledger(ledger):
 
 
 def calc_prem_baseline(ledger):
-    """取每只最近 LEDGER_PREM_WINDOW 个台账日的溢价中位数，样本不足 LEDGER_PREM_MIN 天的不给基准
+    """取每只最近 LEDGER_PREM_WINDOW 个溢价观测的中位数，样本不足 LEDGER_PREM_MIN 的不给基准
 
     为什么不信固定阈值：159941 的年度溢价中位数 2019 年是 -0.82%，2026 年是 +6.80%，
     差出七个多点。拿一个写死的数当尺子，过两年必然失效。
@@ -891,51 +1125,87 @@ def calc_prem_baseline(ledger):
     记 0、最近 60 天记 8——全历史中位数仍是 0，于是「今天的 8%」被算成偏离基准 8 个点，
     天天报⚠；中枢下移时反过来，旧的高值把基准抬住，该报的漏报。
     漂移越慢危害越大，因为每一条单独看都像「今天有点高」，几乎不像异常。
-    取最近 60 天：够长能压住日常噪音，又不让三年前的水平参与决定今天的阈值。
+
+    现在合并两个来源：
+      ① prem_hist（backfill_prem 回填的历史溢价）——让基准立刻可用，不必空等 40 个交易日
+      ② days 里的 prem（每天真实推送时算出来的）
+    同一天两边都有时以 days 为准（它是当日实算的）；按日期排序后取最近 60 个值。
     """
-    hist = {}
-    # 按日期升序遍历：只有这样「取最近 N 天」才真是最近的。台账 dump 用了 sort_keys=True，
-    # 读回来的顺序大概率已经是日期序，但这里不依赖那个隐式前提。
-    for _day, rec in sorted((ledger.get("days") or {}).items()):
+    merged = {}
+    for code, series in (ledger.get("prem_hist") or {}).items():
+        if not isinstance(series, dict):
+            continue
+        bucket = merged.setdefault(code, {})
+        for d, v in series.items():
+            if v is None:
+                continue
+            try:
+                bucket[str(d)] = float(v)
+            except (TypeError, ValueError):
+                continue
+
+    for day_str, rec in (ledger.get("days") or {}).items():
         for code, item in rec.items():
             value = item.get("prem")
             if value is None:
                 continue
-            hist.setdefault(code, []).append(float(value))
-    return {
-        code: statistics.median(vals[-LEDGER_PREM_WINDOW:])
-        for code, vals in hist.items()
-        if len(vals) >= LEDGER_PREM_MIN
-    }
+            try:
+                merged.setdefault(code, {})[day_str] = float(value)
+            except (TypeError, ValueError):
+                continue
+
+    out = {}
+    for code, series in merged.items():
+        vals = [series[d] for d in sorted(series)][-LEDGER_PREM_WINDOW:]
+        if len(vals) >= LEDGER_PREM_MIN:
+            out[code] = statistics.median(vals)
+    return out
 
 
-def record_ledger(ledger, bar_date, metas):
-    """把当日快照写进台账
+def record_ledger(ledger, metas):
+    """把每只标的的快照按它自己的 bar_date 写进台账，返回 (写入只数, 跳过名单)
 
-    只记 ETF 自选列表。事件型（金叉/死叉）入 sig，状态型空着——
-    「持有/观望」每天都成立，存下来没有验证价值，只会把文件撑大。
-    长期趋势和溢价率每天存一份，几个月后就能拿它们做时间序列分析，
-    这正是这次「先观测几个月」的数据基础。
+    为什么不再用「全部标的都是今天的 K 线才记录」：旧条件是
+        if record and bar_dates == {today_full}: record_ledger(...)
+    14 只里只要有 1 只的最后一根不是今天（停牌、接口落后、走腾讯兜底拿到旧数据），
+    当天 14 只全部不记录，而且只在 stdout 打一行。而台账是「实盘胜率」和
+    「溢价动态基准」唯一的数据源——一只拖累全池，这是很差的爆炸半径。
+    改成按各自的 bar_date 记：拿到哪天的数据就记在哪一天，哪只缺了单独列出来。
+
+    sig 只记事件型（金叉/死叉），状态型空着——“持有/观望”每天都成立，
+    存下来没有验证价值，只会把文件撑大。但 sig_date 必须一起存：
+    加了事件回看窗口之后，同一次交叉会在连续 5 天里都被识别到，
+    没有交叉日期就无法去重，胜率分母会虚高 5 倍。
+
+    prem 存的是净值口径（meta["prem_nav"]）而不是展示用的那个：
+    基准是把一个观测和它自己的历史比，口径必须固定；哪天盘中/盘后混着存，
+    中位数就不再是同一个分布的中位数了。
 
     不记收盘价：前复权价会随分红除权整体重算，当年记下的价格和今天查到的
     同一天价格对不上，会凭空多出涨跌幅（verify_ledger 里也是只在同一条序列
-    内部比）。既然不能用来对账，那它就是个死字段——写进去、没人读、还容易
-    让后来人以为能拿它算收益。老台账里的 c 字段留着不动，读的时候不看就行。
+    内部比）。既然不能用来对账，那它就是个死字段。
     """
-    if not bar_date:
-        return 0
-    day = ledger["days"].setdefault(bar_date, {})
+    written = []
+    skipped = []
     for meta in metas:
         if not meta:
             continue
-        day[meta["code"]] = {
-            "sig": meta["event"],
-            "long": meta["long"],
-            "prem": meta["prem"],
-        }
-    if not ledger.get("start"):
-        ledger["start"] = bar_date
-    return len([m for m in metas if m])
+        code = meta.get("code") or ""
+        day_str = meta.get("bar_date") or ""
+        if not code or not day_str:
+            skipped.append(code or "?")
+            continue
+        rec = ledger["days"].setdefault(day_str, {}).setdefault(code, {})
+        rec["sig"] = meta.get("event") or ""
+        rec["sig_date"] = meta.get("event_date") or ""
+        rec["long"] = meta.get("long")
+        # 只在有新值时才覆盖 prem：取不到净值的那天不应该把之前算好的溢价抹掉
+        if meta.get("prem_nav") is not None:
+            rec["prem"] = meta["prem_nav"]
+        written.append(code)
+    if written and not ledger.get("start"):
+        ledger["start"] = min(ledger["days"])
+    return len(written), skipped
 
 
 # 信号方向：金叉后面要涨才算对，死叉后面要跌才算对
@@ -943,15 +1213,21 @@ LEDGER_DIRECTION = {"golden": ("金叉", 1), "death": ("死叉", -1)}
 
 
 def verify_ledger(ledger, metas_by_code):
-    """用台账里的信号日期 + 今天的真实行情，算信号后第 N 个交易日的涨跌
+    """用台账里的交叉日期 + 今天的真实行情，算交叉后第 N 个交易日的涨跌
 
     为什么不用台账里记的收盘价：前复权价会随分红除权整体重算，
     拿当年记下的价格和今天查到的同一天价格比，会凭空多出涨跌幅。
-    所以只在同一条序列内部比（信号日收盘 vs N 个交易日后的收盘）。
+    所以只在同一条序列内部比（交叉日收盘 vs N 个交易日后的收盘）。
+
+    两道去重：
+      ① 按 (代码, 交叉类型, 交叉日) 去重。加了回看窗口之后，同一次交叉会在连续
+         5 天的推送里都被识别到、也被记 5 次；不去重的话分母直接虚高 5 倍。
+      ② sig_date 缺失（老台账）时退回用记录日当交叉日。
 
     返回 {信号类型: {N: [每笔涨跌]}}，未满 N 日的不计入。
     """
     out = {}
+    seen = set()
     for code, meta in metas_by_code.items():
         if not meta:
             continue
@@ -961,9 +1237,14 @@ def verify_ledger(ledger, metas_by_code):
             item = rec.get(code)
             if not item or not item.get("sig"):
                 continue
-            i = idx.get(day_str)
+            sig_date = item.get("sig_date") or day_str
+            key = (code, item["sig"], sig_date)
+            if key in seen:
+                continue
+            i = idx.get(sig_date)
             if i is None:
                 continue
+            seen.add(key)
             for n in LEDGER_FORWARD:
                 j = i + n
                 if j >= len(closes) or closes[i] <= 0:
@@ -971,6 +1252,112 @@ def verify_ledger(ledger, metas_by_code):
                 out.setdefault(item["sig"], {}).setdefault(n, []).append(
                     closes[j] / closes[i] - 1)
     return out
+
+
+def calc_baseline(metas_by_code, window=250):
+    """每只标的在统一窗口内的「无条件 N 日收益均值」，作为信号收益的对照
+
+    没有这个对照，「5日 22/40 胜 均+0.4%」是无法解读的：如果同期这 14 只随便哪天买、
+    持有 5 天的平均收益是 +1.2%，那这个金叉实际是跑输 0.8 个点，而文案读起来像「小赚」。
+    信号赚的到底是信号本身还是市场 beta，只有减掉基准才看得出来。
+
+    窗口统一取最近 250 个交易日：不同标的的序列长度实测从 400 根到 3346 根不等，
+    不统一窗口的话基准本身就被长历史的早期行情带偏了。
+    """
+    per_n = {}
+    for meta in metas_by_code.values():
+        if not meta:
+            continue
+        closes = meta["closes"][-window:]
+        for n in LEDGER_FORWARD:
+            if len(closes) <= n:
+                continue
+            rets = [closes[i + n] / closes[i] - 1
+                    for i in range(len(closes) - n) if closes[i] > 0]
+            if rets:
+                per_n.setdefault(n, []).append(sum(rets) / len(rets))
+    return {n: sum(v) / len(v) for n, v in per_n.items() if v}
+
+
+def count_signals(days, sig):
+    """台账里某类交叉的真实次数（按 代码 + 交叉日 去重）
+
+    不能直接数 sig 字段：回看窗口让同一次交叉连着记好几天，直接计数会把 1 次算成 5 次。
+    """
+    seen = set()
+    for day_str, rec in days.items():
+        for code, item in rec.items():
+            if not item or item.get("sig") != sig:
+                continue
+            seen.add((code, item.get("sig_date") or day_str))
+    return len(seen)
+
+
+def backfill_prem(ledger, codes=None, days=PREM_HIST_KEEP):
+    """用历史净值 + 不复权收盘，回填台账里缺失的溢价历史，返回成功只数
+
+    为什么需要这个：calc_prem_baseline 要求每只标的攒够 LEDGER_PREM_MIN 个观测，
+    而台账每天只贡献 1 个——意味着动态基准要等 8 周才首次生效，这段时间里
+    一直在用注释里刚论证过「注定失效」的固定阈值。
+    fund_open_fund_info_em 能一次拿到完整净值历史（ETF 与 LOF 都覆盖，实测）。
+    所以这一步可以一次把 90 天补满。
+
+    只写 prem_hist，不碰 days：days 是「真实推送记录」，塞进回填数据会让
+    「自 X 月 X 日起累计 N 个交易日」变成一句谎话，而那句话是用来判断
+    台账有没有在正常回写的。
+    """
+    codes = codes or ETF_LIST
+    hist = ledger.setdefault("prem_hist", {})
+    filled = 0
+    for code in codes:
+        navs = fetch_nav_history(code, days=days)
+        if not navs:
+            print(f"[回填] {code} 净值历史不可用，跳过")
+            continue
+        px = fetch_kline_tencent(code, count=days + 40, adjust=False)
+        if px is None or px.empty:
+            print(f"[回填] {code} 不复权日线不可用，跳过")
+            continue
+        close_map = {str(d)[:10]: float(v) for d, v in zip(px["日期"], px["收盘"])}
+        series = {}
+        for d, nav in navs.items():
+            close = close_map.get(d)
+            if not close or not nav or nav <= 0:
+                continue
+            series[d] = round((close / nav - 1) * 100, 2)
+        if not series:
+            print(f"[回填] {code} 净值与收盘没有重合日期，跳过")
+            continue
+        hist.setdefault(code, {}).update(series)
+        filled += 1
+        print(f"[回填] {code} 写入 {len(series)} 天溢价 "
+              f"（{min(series.values()):+.2f}% ~ {max(series.values()):+.2f}%，"
+              f"截至 {max(series)}）")
+    return filled
+
+
+def ensure_prem_history():
+    """盘后写台账前，给还没有溢价基准的标的补一次历史，返回补成功的只数
+
+    为什么不要求人手动跑 --backfill-prem：那份说明贴在 README 里，而真正会看
+    README 的人本来就不会被这个问题困住。不补的话，动态基准要空等 40 个交易日，
+    这 8 周里天天用的都是注释里刚证伪的固定阈值。
+
+    为什么不会每跳都联网：开关就是「有没有基准」。建好之后 calc_prem_baseline
+    直接返回，pending 为空，这里一次请求都不发。只有首次部署、新加标的、
+    或净值历史被裁掉时才触发。
+    """
+    ledger = load_ledger()
+    have = calc_prem_baseline(ledger)
+    pending = [c for c in ETF_LIST if c not in have]
+    if not pending:
+        return 0
+    print(f"[回填] {len(pending)} 只还没有溢价基准，补历史净值：{pending}")
+    filled = backfill_prem(ledger, codes=pending)
+    if filled:
+        save_ledger(ledger)
+        print(f"[回填] 已写入 {filled} 只的溢价历史")
+    return filled
 
 
 def ledger_staleness(ledger, metas_by_code):
@@ -995,19 +1382,28 @@ def ledger_staleness(ledger, metas_by_code):
     return len(ref) - 1 - ref.index(last)
 
 
-def build_ledger_lines(ledger, stats, stale=None):
-    """拼实盘胜率段落；该 N 日样本不足 LEDGER_MIN_SAMPLE 笔时只报笔数
+def build_ledger_lines(ledger, stats, stale=None, baseline=None):
+    """拼信号跟踪段落；该 N 日样本不足 LEDGER_MIN_SAMPLE 笔时只报笔数
 
     为什么要设门槛：原来「5日 1/1 胜 均+2.3%」和「5日 52/68 胜 均+0.4%」
     在微信里排版一模一样——都是一行里跟着「胜 均」。但 1 笔的胜率没有信息量，
     它就是那一天的涨跌，换个日期就能从 100% 翻到 0%，读的人却会当成「这套规则准」。
     门槛以下只报笔数（N 日 M 笔），凑够了才谈胜率和均值。
 
+    为什么要给超额（baseline）：没有对照时「均+0.4%」无法解读——同期这批标的
+    随便哪天买、持有 N 天的平均收益如果是 +1.2%，那这个信号实际是跑输 0.8 个点，
+    而文案读起来像「小赚」。超额 =（信号后涨跌 − 同期无条件涨跌）× 信号方向，
+    只有它才是「信号本身有没有信息」，均值里混着市场 beta。
+
+    标题从「实盘验证」改成「信号跟踪」：后者不替这套规则背书。如果金叉真的
+    没有预测力，这一节就应该稳定显示 50% 和负超额——那是验证结果，不是罪。
+    叫「验证」会让人默认它已经通过了。
+
     stale 是台账落后最新行情几个交易日（见 ledger_staleness）。传 None 表示判断不了，
     不告警——宁可漏报，不要把「不知道」印成一条假警报。
     """
     days = ledger.get("days") or {}
-    lines = ["### 📈 实盘验证", ""]
+    lines = ["### 🧪 信号跟踪", ""]
     if not days:
         lines.append("- 台账为空，盘后推送后开始累计（首日没有胜率可算）")
         lines.append("")
@@ -1025,8 +1421,8 @@ def build_ledger_lines(ledger, stats, stale=None):
     has_any = False     # 有已结算样本，哪怕只有 1 笔（下面文案要说"样本不足"而不是"没有"）
     has_stat = False    # 有达到门槛的样本，才配叫胜率
     for sig, (name, direction) in LEDGER_DIRECTION.items():
-        total = sum(1 for rec in days.values()
-                    for code, item in rec.items() if item.get("sig") == sig)
+        # 按 代码+交叉日 去重：回看窗口会让同一次交叉连续记录多天
+        total = count_signals(days, sig)
         if not total:
             continue
         chunks = []
@@ -1043,7 +1439,12 @@ def build_ledger_lines(ledger, stats, stale=None):
                 continue
             has_stat = True
             mean = sum(vals) / len(vals) * 100
-            chunks.append(f"{n}日 {win}/{len(vals)} 胜 均{mean:+.1f}%")
+            text = f"{n}日 {win}/{len(vals)} 胜 均{mean:+.1f}%"
+            bench = (baseline or {}).get(n)
+            if bench is not None:
+                excess = (mean / 100 - bench) * direction * 100
+                text += f" 超额{excess:+.1f}%"
+            chunks.append(text)
         lines.append(f"- **{name}** 发出 {total} 次 · " + " · ".join(chunks))
 
     if not has_any:
@@ -1052,8 +1453,10 @@ def build_ledger_lines(ledger, stats, stale=None):
         lines.append(f"- 已结算样本不足 {LEDGER_MIN_SAMPLE} 笔，暂不出胜率"
                      "（样本少时一两天就能把胜率翻面）")
     else:
-        lines.append(f"- 满 {LEDGER_MIN_SAMPLE} 笔才出胜率；均值是实际涨跌，"
-                     "金叉后跌/死叉后涨都算输")
+        lines.append(f"- 满 {LEDGER_MIN_SAMPLE} 笔才出胜率；超额 =（信号后涨跌 − 同期无条件涨跌）"
+                     "× 信号方向，只有它才是信号自己的贡献")
+    lines.append("- 这一节是记录，不是成绩单：金叉/死叉判方向已被证伪，"
+                 "接近 50% 的胜率是预期内结果")
     lines.append("")
     return lines
 
@@ -1062,7 +1465,6 @@ def build_ledger_lines(ledger, stats, stale=None):
 def build_message(now, slot, record=False):
     now_str = now.strftime("%Y-%m-%d %H:%M")
     today = now.strftime("%m-%d")
-    today_full = now.strftime("%Y-%m-%d")
 
     # 只拉一次全市场实时行情，所有 ETF 复用，避免逐只重复请求
     use_spot = should_apply_spot(slot, now)
@@ -1162,18 +1564,25 @@ def build_message(now, slot, record=False):
     lines.append(text)
     lines.append("")
 
-    # 台账：先把当日快照落盘，再算胜率，这样首日推送就能显示「累计 1 个交易日」
-    # 只在拿到当日真实K线时记录，否则记下的就是上一交易日的价格，会把日期弄错一天
-    bar_dates = {m["bar_date"] for m in metas if m.get("bar_date")}
-    if record and bar_dates == {today_full}:
-        record_ledger(ledger, today_full, metas)
-        save_ledger(ledger)
-    elif record:
-        print(f"[台账] 当日K线未齐（{sorted(bar_dates) or '无'}），本次不记录")
+    # 台账：先把当日快照落盘，再算跟踪，这样首日推送就能显示「累计 1 个交易日」
+    # 按每只标的自己的 bar_date 记，不再要求全池就绪：旧条件
+    # （bar_dates == {today}）在 14 只里只要有 1 只落后就导致全池当天不记录，
+    # 而它只在 stdout 打一行，没有任何人能看见。
+    if record and metas:
+        written, skipped = record_ledger(ledger, metas)
+        if written:
+            save_ledger(ledger)
+        print(f"[台账] 已记录 {written} 只")
+        if skipped:
+            print(f"[台账] {len(skipped)} 只没有基准日，本次未记录: {skipped}")
 
     metas_by_code = {m["code"]: m for m in metas}
-    lines.extend(build_ledger_lines(ledger, verify_ledger(ledger, metas_by_code),
-                                    ledger_staleness(ledger, metas_by_code)))
+    lines.extend(build_ledger_lines(
+        ledger,
+        verify_ledger(ledger, metas_by_code),
+        ledger_staleness(ledger, metas_by_code),
+        calc_baseline(metas_by_code),
+    ))
 
 
     # 数据来源说明，让消息里能看出算的是哪一天的价
@@ -1185,9 +1594,7 @@ def build_message(now, slot, record=False):
     # 补价只留在运行日志里：排查数据源时有用，对读者没有信息量
     if patched_count:
         print(f"[数据] {patched_count}/{total} 只用实时价补了当日K线")
-    if slot == "pre":
-        notes.append("盘前时段，指标按上一交易日收盘计算")
-    elif not fresh_count:
+    if not fresh_count:
         # 历史接口和实时价都没给到今天的数据
         notes.append("⚠ 当日行情未取到，ETF 信号为上一交易日数据")
     else:
@@ -1205,18 +1612,25 @@ def build_message(now, slot, record=False):
             # 不区分“接口没给价”和“触发折算保护主动不补”，两种情况都去日志里看具体原因
             notes.append(f"⚠ 当日价未补齐：{name_list(stale)}（原因见运行日志）")
     notes.append(f"场外基金（{BOND_CODE}/{OTHER_FUND}）净值为 T+1，通常滞后一天")
+    # 数据源分布：三条分支的窗口长度差很多（实测 400 / 601 / 3346 根），
+    # 而对外文案原来统一写「数据来源：东方财富 / 腾讯」，读者无从判断某只到底走的哪条源。
+    # 盘后排查「某只数字不对劲」时，这一行是第一手线索。
+    src_line = source_summary([m.get("source", "") for m in metas if m])
+    if src_line:
+        notes.append(f"数据源：{src_line}")
     lines.extend(f"- {note}" for note in notes)
     lines.append("")
 
-    # 尾注只说证据支持的话。原来那句「有死叉或重大利空优先减仓」是模型
-    # 还叫「信号模型」时留下的，而金叉/死叉判方向已经被实测推翻（30 只
-    # 22260 个观测，超额≈0）——继续留着等于让一条已证伪的规则替读者做决定。
-    # 以后改这三行只加实测支持的内容，不要再写成买卖指令。
-    # 必须带 "- " 列表前缀：上面约 170 行写过这条规矩——两个 append 之间只有一
-    # 个 \n，在 Markdown 里是软换行，微信会把三句挤成一段。凑成一段就没人读完。
-    lines.append("- 💡 有证据的三件事：**长期↓** 当排除器用（↑ 内部排序≈噪声）、"
-                 "**MA200 缓冲带** 主要作用是控回撤不是选方向、"
-                 "**溢价率** 比的是该品种自己的历史中位")
+    # 尾注只说证据支持的话，且按证据强度分档——不能把 6 只样本的结论和 30 只样本的
+    # 结论写成同一句话。原来那句「有证据的三件事」里，金叉证伪用了 30 只/22260 个观测，
+    # 而 MA200 缓冲带只用了 6 只/742 个交易日、回撤从 19.1% 到 18.4%（0.7 个点），
+    # 两者差一个量级，并列在一起等于把弱证据抬成强证据。
+    # 必须带 "- " 列表前缀：上面约 170 行写过这条规矩——两个 append 之间只有一个 \n，
+    # 在 Markdown 里是软换行，微信会把三句挤成一段。凑成一段就没人读完。
+    lines.append("- 💡 证据较强的两件事：**溢价率** 只和该品种自己的历史中位比（不跨品种比）、"
+                 "**长期↓** 当排除器用（↑ 内部排序≈噪声）")
+    lines.append("- 💡 证据较弱的一件事：**MA200 缓冲带** 只在 6 只/742 个交易日上验过，"
+                 "最大回撤 19.1%→18.4%（0.7pp）——方向可能有，幅度接近噪声，别当承诺")
     lines.append("- 💡 已证伪的一件事：🟢金叉/🔴死叉 判断方向"
                  "（30 只 22260 个观测，超额≈0）——它只是标记，不是买卖指令")
     lines.append("- 💡 本信息仅供行情回顾，不构成投资建议")
@@ -1278,14 +1692,37 @@ def send_serverchan(title, content, preview=False, max_retries=3):
 # ==================== 入口 ====================
 def main():
     parser = argparse.ArgumentParser(description="ETF 信号分析并推送到微信（Server酱）")
-    parser.add_argument("--slot", default=None, help="指定时段：pre / mid / close / manual，留空按当前北京时间判定")
+    parser.add_argument("--slot", default=None, help="指定时段：mid / close / manual，留空按当前北京时间判定")
     parser.add_argument("--detect-slot", action="store_true", help="只输出当前时段，供 GitHub Actions 使用")
     parser.add_argument("--preview", action="store_true", help="只生成并打印消息，不调用 Server酱（不占每天 5 条额度）")
     parser.add_argument("--record", action="store_true",
                         help="强制把当日快照写入台账（默认只在盘后自动推送时写，预览不污染数据）")
+    parser.add_argument("--backfill-prem", action="store_true",
+                        help="用历史净值回填溢价历史（一次性，不推送），让动态基准立刻生效")
     args = parser.parse_args()
 
     now = beijing_now()
+
+    # 回填是一个独立的一次性任务：它不取行情、不算指标、不推送，
+    # 放在时段判定之前，否则会被窗口逻辑直接跳过。
+    if args.backfill_prem:
+        ledger = load_ledger()
+        filled = backfill_prem(ledger)
+        if not filled:
+            print("[回填] 没有写入任何数据，台账保持不变")
+            return 1
+        save_ledger(ledger)
+        base = calc_prem_baseline(ledger)
+        print(f"\n[回填完成] {filled} 只；已建立动态基准的 {len(base)} 只"
+              f"（门槛 {LEDGER_PREM_MIN} 个观测）:")
+        for code, value in sorted(base.items()):
+            print(f"  {code}: 中位 {value:+.2f}%  "
+                  f"→ warn {value + PREMIUM_DEV_WARN:+.2f}% / "
+                  f"heavy {value + PREMIUM_DEV_HEAVY:+.2f}%")
+        missing = [c for c in ETF_LIST if c not in base]
+        if missing:
+            print(f"  仍未建立基准（样本不足或取不到净值）: {missing}")
+        return 0
 
     # Actions 用来决定"这一跳要不要真正干活"
     if args.detect_slot:
@@ -1306,11 +1743,18 @@ def main():
     print(f"开始生成信号（北京时间 {now.strftime('%Y-%m-%d %H:%M')}，{slot_label(slot)}）...")
     # 台账只在盘后写：盘中价随时在变，记下去会把当天信号定成当时那个快照
     record = args.record or (slot == "close" and not args.preview)
+    # 回填必须在 build_message 之前：build_message 内部会用台账算溢价基准，
+    # 先补上这一轮消息就能直接用新基准，不用等下一跳。
+    if record:
+        try:
+            ensure_prem_history()
+        except Exception as exc:   # 回填失败不能拖垮推送，它只是锦上添花
+            print(f"[回填] 跳过（{exc}）")
     content = build_message(now, slot, record=record)
     print(content)
     print("-" * 40)
 
-    # 标题会显示在微信通知栏，带上时间便于区分一天里的三条
+    # 标题会显示在微信通知栏，带上时间便于区分一天里的两条
     title = f"ETF信号助手·{slot_label(slot)}·{now.strftime('%m-%d %H:%M')}"
     if not send_serverchan(title, content, preview=args.preview):
         # 退出码非 0，让 Actions 变红，避免"静默失败"
