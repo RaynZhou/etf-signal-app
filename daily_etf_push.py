@@ -1674,14 +1674,14 @@ def build_message(now, slot, record=False):
     # 债市晴雨表（场外基金，没有实时价，净值本身 T+1）
     lines.append("### 📊 债市晴雨表")
     lines.append("")
-    text, _, _, _ = analyze_one(BOND_CODE, now, spot_prices, use_spot=False, show_long=False)
+    text, bond_bar, _, _ = analyze_one(BOND_CODE, now, spot_prices, use_spot=False, show_long=False)
     lines.append(text)
     lines.append("")
 
     # 单独基金
     lines.append("### 📌 其他基金")
     lines.append("")
-    text, _, _, _ = analyze_one(OTHER_FUND, now, spot_prices, use_spot=False, show_long=False)
+    text, other_bar, _, _ = analyze_one(OTHER_FUND, now, spot_prices, use_spot=False, show_long=False)
     lines.append(text)
     lines.append("")
 
@@ -1732,7 +1732,14 @@ def build_message(now, slot, record=False):
         if stale:
             # 不区分“接口没给价”和“触发折算保护主动不补”，两种情况都去日志里看具体原因
             notes.append(f"⚠ 当日价未补齐：{name_list(stale)}（原因见运行日志）")
-    notes.append(f"场外基金（{BOND_CODE}/{OTHER_FUND}）净值为 T+1，通常滞后一天")
+    # 原句写死「净值为 T+1，通常滞后一天」：对 270044（境内债基）对，对 270023（QDII）是错的——
+    # 它实测要两个交易日才出净值。猜一个通用天数不如把本次真正取到的日期印出来，
+    # 读者自己能对上（app 那边的说明早就是这个写法）。
+    fund_bars = "、".join(f"{c} 到 {b}" for c, b in ((BOND_CODE, bond_bar),
+                                                     (OTHER_FUND, other_bar)) if b)
+    notes.append("场外基金净值事后才公布，滞后因品种而异：境内约 T+1、"
+                 "QDII 常两个交易日"
+                 + (f"（本次 {fund_bars}）" if fund_bars else "（本次未取到净值）"))
     # 数据源分布：三条分支的窗口长度差很多（实测 400 / 601 / 3346 根），
     # 而对外文案原来统一写「数据来源：东方财富 / 腾讯」，读者无从判断某只到底走的哪条源。
     # 盘后排查「某只数字不对劲」时，这一行是第一手线索。
@@ -1882,7 +1889,11 @@ def main():
         except Exception as exc:   # 回填失败不能拖垮推送，它只是锦上添花
             print(f"[回填] 跳过（{exc}）")
     content = build_message(now, slot, record=record)
-    print(content)
+    # 预览时整条正文只在 send_serverchan 里打一遍（那边还带标题），两边各打一次
+    # 会让 Actions 日志里同一段 60 行的文字出现两遍，翻屏找不到重点。
+    # 非预览时这里必须打：那是「实际发出去了什么」的唯一日志凭证。
+    if not args.preview:
+        print(content)
     print("-" * 40)
 
     # 标题会显示在微信通知栏，带上时间便于区分一天里的两条
