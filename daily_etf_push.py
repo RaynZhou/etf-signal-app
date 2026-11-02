@@ -729,6 +729,38 @@ def calculate_rsi(series, period=14):
     return 100 - (100 / (1 + avg_gain / avg_loss))
 
 
+# 东财熔断：连续多少只场内标的的东财分支拿不到可用数据，就放弃本轮剩余的东财请求。
+# 实测东财全面不可用时，每只的代价是 2 个分支 × 2 次重试 × 1s 休眠 ≈ 4 秒，14 只近 1 分钟。
+# 定 5 而不是 3：2026-11-02 实测出现过「14 只里 4 只失败、其余东财正常」的日子，
+# 阈值太低会把还能用的源换成价格只有 3 位小数的腾讯（实测会让 RSI 有小但真实的偏差）。
+EM_BREAKER_LIMIT = 5
+EM_RETRY_SLEEP = 1.0   # 失败后的休眠；测试里置 0，不为了等接口而拖慢单测
+
+# 熔断状态挂在模块级：一次进程就是一轮取数。但长驻的 app 会跨轮复用进程，
+# 所以每轮开头必须调 reset_em_breaker() 归零，否则一次误熔断就永远只走腾讯。
+_EM_STATE = {"fails": 0, "tripped": False, "skipped": 0}
+
+
+def reset_em_breaker():
+    """一轮取数开始前把熔断状态归零（推送和 app 各自在循环前调）"""
+    _EM_STATE["fails"] = 0
+    _EM_STATE["tripped"] = False
+    _EM_STATE["skipped"] = 0
+
+
+def em_breaker_note():
+    """给底部「数据源」那行的补充说明：东财被主动跳过时必须注明
+
+    不注明的话，「数据源：腾讯 14」在「东财逐只失败后兜底」和「我们主动熔断」
+    两种情形下完全同形，而它们对读者的含义不同：前者该去查接口，后者只是省时间。
+    标记要说的是数据状态，不是来源。
+    """
+    if not _EM_STATE["tripped"]:
+        return ""
+    return (f"东财连续 {EM_BREAKER_LIMIT} 只无返回后，已跳过其余 "
+            f"{_EM_STATE['skipped']} 只的东财请求（直接改用腾讯历史日线）")
+
+
 def fetch_data(symbol, max_retries=2):
     """取历史日线，返回含「日期 / 收盘」的 DataFrame，df.attrs 里带数据源与根数
 
@@ -753,14 +785,20 @@ def fetch_data(symbol, max_retries=2):
     对单只标的的指标没影响（滞回递推会收敛），但任何跨标的比较都会因窗口不同而不可比。
     而旧版的失败只在 stdout 打一行，消息里仍统一写「数据来源：东方财富 / 腾讯」，
     读者无从判断某只到底走的哪条源。这个标签现在会一路带到推送底部。
+
+    熔断：东财整条线塌掉时每只白等约 4 秒，14 只近 1 分钟。现在连续
+    EM_BREAKER_LIMIT 只拿不到数据就放弃本轮剩余的东财请求，直接走腾讯兜底。
+    关键豁免：场外基金不参与熔断也不计入失败次数——它们只有东财一条路、没有
+    兜底源，跟着跳过的后果是债市晴雨表整节从推送里消失，那比慢 40 秒严重得多。
     """
     import akshare as ak
     now = beijing_now()
     end_date = now.strftime("%Y%m%d")
     start_date = (now - timedelta(days=HISTORY_DAYS)).strftime("%Y%m%d")
     last_error = None
+    on_ex = is_onexchange(symbol)
 
-    if is_onexchange(symbol):
+    if on_ex:
         attempts = [
             ("eastmoney-band", lambda: ak.fund_etf_hist_em(
                 symbol=symbol, period="daily",
@@ -778,6 +816,12 @@ def fetch_data(symbol, max_retries=2):
                 symbol=symbol, indicator="累计净值走势")),
         ]
 
+    # 已熔断且这只还有兜底可退（场内）才跳过东财；场外永远试，它没有第二条路
+    skipped = bool(on_ex and _EM_STATE["tripped"])
+    if skipped:
+        attempts = []
+        _EM_STATE["skipped"] += 1
+
     for source, call in attempts:
         for _attempt in range(max_retries):
             try:
@@ -785,18 +829,31 @@ def fetch_data(symbol, max_retries=2):
                 if df is not None and not df.empty:
                     df.attrs["source"] = source
                     df.attrs["bars"] = len(df)
+                    if on_ex:
+                        # 成功一次就把连续失败归零：间歇抽风不应累积成熔断
+                        _EM_STATE["fails"] = 0
                     return df
             except Exception as e:
                 last_error = e
-            time.sleep(1.0)
+            time.sleep(EM_RETRY_SLEEP)
+
+    # 东财这一只彻底没成功。只有场内计入熔断计数：它没有兜底源的那只不计，
+    # 计进去只会让熔断提前误触发
+    if on_ex and not skipped:
+        _EM_STATE["fails"] += 1
+        if not _EM_STATE["tripped"] and _EM_STATE["fails"] >= EM_BREAKER_LIMIT:
+            _EM_STATE["tripped"] = True
+            print(f"[熔断] 东财连续 {_EM_STATE['fails']} 只无返回，"
+                  f"本轮剩余场内标的直接改用腾讯历史日线")
 
     # 场内 ETF 兜底：腾讯历史日线，同样是市价 + 前复权，口径与东财一致
-    if is_onexchange(symbol):
+    if on_ex:
         df = fetch_kline_tencent(symbol)
         if df is not None:
             df.attrs["source"] = "tencent"
             df.attrs["bars"] = len(df)
-            print(f"[提示] {symbol} 东财未返回行情，改用腾讯历史日线")
+            why = "东财已被熔断跳过" if skipped else "东财未返回行情"
+            print(f"[提示] {symbol} {why}，改用腾讯历史日线")
             return df
 
     print(f"[警告] {symbol} 获取失败: {last_error}")
@@ -821,6 +878,30 @@ def prem_flag(prem, base=None):
     if prem >= warn:
         return "warn"
     return ""
+
+
+# 「逆风 + 贵」组合约束的展示文案
+GATE_LABEL = "不宜加仓"
+GATE_TEXT = f"**{GATE_LABEL}**"
+
+
+def gate_note(long_state, prem, prem_base_value):
+    """同时满足「长期↓」和「溢价到重警线」才触发的约束，返回要追加的文字（不触发给空串）
+
+    为什么这两个叠在一起才有意义：长期↓ 单独看只是「价格在年线下方」，溢价高单独看
+    只是「买的人多」，两个各自都被证伪过或只是当期描述。合起来说的是一件有依据的事——
+    此刻用市价买入，既站在趋势的反方向上，又在为该品种历史上少见的价格偏离付钱。
+    它的正当性来自两个当期已经存在的事实，不来自对明天涨跌的预测。
+
+    溢价基准取该品种自己的中位数（prem_base_value），没有基准时按绝对阈值判——
+    和 prem_flag 完全同一条线，不另外定义什么叫「贵」。
+    推送和 app 都调这个函数拿文案：两边各写一遍措辞，早晚分叉（已经有过教训）。
+    """
+    if long_state != 0 or prem is None:
+        return ""
+    if prem_flag(prem, prem_base_value) != "heavy":
+        return ""
+    return GATE_TEXT
 
 
 def find_last_cross(df, lookback=EVENT_LOOKBACK):
@@ -1043,6 +1124,9 @@ def analyze_one(symbol, now, spot_prices, use_spot=True, fund_snap=None,
             if prem_flag(prem, (prem_base or {}).get(symbol)) == "heavy":
                 prem_text += "⚠"
 
+        # 「逆风 + 贵」的组合约束；场外基金 long 为 None，永远不会触发
+        gate = gate_note(long_state, prem, (prem_base or {}).get(symbol))
+
         # Markdown 列表项：- 图标 **代码** 产品名 · 信号 · RSI · 长期 · 溢价 · 基准日
         # 名称紧跟代码、用空格隔开（不拿 · 隔，否则一行被切成太多块反而难读）
         # 当日标记直接用文字：全角＊在手机上渲染得太小看不清，半角 * 又会被 Markdown 当斜体
@@ -1059,6 +1143,8 @@ def analyze_one(symbol, now, spot_prices, use_spot=True, fund_snap=None,
             parts.append("**长期↓**")
         if prem_text:
             parts.append(prem_text)
+        if gate:
+            parts.append(gate)
         suffix = bar_suffix(bar_date, now)
         if suffix:
             parts.append(suffix)
@@ -1071,6 +1157,9 @@ def analyze_one(symbol, now, spot_prices, use_spot=True, fund_snap=None,
             "event_date": ev["event_date"],
             "event_days_ago": ev["event_days_ago"],
             "long": long_state,
+            # 展示层用的约束标记，只给底部那句解释数「今天触发了几只」；
+            # record_ledger 只认自己那几个键，这个不会进台账
+            "gate": gate,
             "close": ev["close"],
             "prem": prem,
             # 台账只存净值口径的 prem（基准是同一分布的中位数，混入口径就失效了）。
@@ -1092,7 +1181,10 @@ def analyze_one(symbol, now, spot_prices, use_spot=True, fund_snap=None,
 # ==================== 信号台账（实盘胜率） ====================
 # 为什么需要落盘：Actions 每次跑都是全新容器，不存就永远是「第一次」
 # 台账结构（紧凑键名，控制文件体积）：
-#   {"version":1, "start":"摘要日", "days": {"2026-10-30": {"159941": {"sig":事件, "long":状态, "prem":溢价}}}}
+#   {"version":1, "start":"摘要日", "days": {"2026-10-30": {"159941":
+#    {"sig":事件, "long":状态, "prem":溢价, "gate":是否触发不宜加仓}}}}
+# gate 只存事实、不进 verify_ledger 的胜率结算：它不是一个可交易信号，
+# 拿它去算胜率等于把一个成本约束当成方向判断——那正是金叉已经被证伪的那类错。
 
 def load_ledger():
     """读台账；文件不存在或损坏都当空台账——宁可丢胜率，不能让推送发不出去"""
@@ -1226,6 +1318,10 @@ def record_ledger(ledger, metas):
         # 只在有新值时才覆盖 prem：取不到净值的那天不应该把之前算好的溢价抹掉
         if meta.get("prem_nav") is not None:
             rec["prem"] = meta["prem_nav"]
+        # 触发与否每天都重写，不只在触发时写 1：同一个交易日可能被跑两次
+        # （外部定时器一次 + 网页手动 Run 一次），只写 1 的话前一跳触发、后一跳
+        # 没触发时 1 会留在原地，统计出来的频率永远偏高
+        rec["gate"] = 1 if meta.get("gate") else 0
         written.append(code)
     if written and not ledger.get("start"):
         ledger["start"] = min(ledger["days"])
@@ -1509,6 +1605,7 @@ def build_message(now, slot, record=False):
     patched_count = 0
     fresh_count = 0
     metas = []
+    reset_em_breaker()   # 一轮取数一个状态：熔断不跟上一轮继承
 
     # 按大类分小节，每节内保持完整详情（信号/RSI/长期/溢价/基准日一个不少）
     # 分组只是为了长正文能扫读：14 只不分节连成一片，找一只得逐行看
@@ -1642,6 +1739,16 @@ def build_message(now, slot, record=False):
     src_line = source_summary([m.get("source", "") for m in metas if m])
     if src_line:
         notes.append(f"数据源：{src_line}")
+    breaker = em_breaker_note()
+    if breaker:
+        notes.append(breaker)
+    gated = [m for m in metas if m and m.get("gate")]
+    if gated:
+        # 只在真触发了才解释，不触发就整行不出现——否则天天一行没人看得懂的文字很噪
+        notes.append(f"⛔ 「{GATE_TEXT}」触发 {len(gated)} 只：**当期既贵又逆风**——"
+                     f"同时满足「长期↓」和「溢价到重警线」（有基准=高出本品种最近 "
+                     f"{LEDGER_PREM_WINDOW} 天中位 {PREMIUM_DEV_HEAVY:g}pp，"
+                     f"无基准=绝对 {PREMIUM_HEAVY:g}%）。这是成本约束，不是预测它会跌")
     lines.extend(f"- {note}" for note in notes)
     lines.append("")
 
