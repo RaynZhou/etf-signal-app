@@ -143,7 +143,9 @@ def premium_text(code, ev, base=None):
     prem = ev.get("prem")
     if prem is None:
         return ""
-    text = f"溢价 {prem:.2f}%"
+    # 1 位小数是为了和微信推送逐位对齐：推送 14.9%、这里 14.93%，
+    # 对照着看会以为两边算的是两个东西（溢价本身是净值日结算的，第 2 位没有信息量）
+    text = f"溢价 {prem:.1f}%"
     label = ev.get("prem_label") or ""
     if label:
         text += f"({label})"
@@ -216,7 +218,7 @@ def render_detail(code, ev, base):
     c1, c2, c3 = st.columns(3)
     c1.metric("数据基准", dp.bar_suffix(ev["bar_date"], dp.beijing_now()) or ev["bar_date"])
     c2.metric("长期趋势", long_text(ev["long"]))
-    c3.metric("溢价", "—" if ev["prem"] is None else f"{ev['prem']:.2f}%")
+    c3.metric("溢价", "—" if ev["prem"] is None else f"{ev['prem']:.1f}%")
 
     # 「逆风 + 贵」的组合约束：措辞直接调推送那边同一个函数，两边不能各写一套
     # 文案只讲已发生的事实（既贵又逆风），不写「风险较高/建议观望」这类会被二次解读的词
