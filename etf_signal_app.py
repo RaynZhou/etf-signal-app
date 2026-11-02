@@ -67,6 +67,9 @@ def load_signals(codes):
     evaluate 之外的展示层会自动退回绝对阈值。
     """
     codes = list(codes)
+    # app 是长驻进程，熔断状态不能跟上一轮复用：早上一次误熔断就会永远只走腾讯，
+    # 而腾讯价格只有 3 位小数。每轮取数开头归零。
+    dp.reset_em_breaker()
     now = dp.beijing_now()
     on_exchange = [c for c in codes if dp.is_onexchange(c)]
     spot = dp.get_spot_prices(on_exchange) if on_exchange else {}
@@ -214,6 +217,12 @@ def render_detail(code, ev, base):
     c1.metric("数据基准", dp.bar_suffix(ev["bar_date"], dp.beijing_now()) or ev["bar_date"])
     c2.metric("长期趋势", long_text(ev["long"]))
     c3.metric("溢价", "—" if ev["prem"] is None else f"{ev['prem']:.2f}%")
+
+    # 「逆风 + 贵」的组合约束：措辞直接调推送那边同一个函数，两边不能各写一套
+    # 文案只讲已发生的事实（既贵又逆风），不写「风险较高/建议观望」这类会被二次解读的词
+    if dp.gate_note(ev.get("long"), ev["prem"], (base or {}).get(code)):
+        st.warning(f"{dp.GATE_LABEL}：当期既贵又逆风——同时满足「长期↓」"
+                   "和「溢价到本品种重警线」。这是成本约束，不是预测它会跌。")
 
     if not dp.is_onexchange(code):
         st.caption("场外基金只有净值、没有盘中价：净值 T+1 公布（QDII 常滞后 2 天）。"
