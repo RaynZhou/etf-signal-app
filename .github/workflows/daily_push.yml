@@ -149,6 +149,17 @@ jobs:
           fi
           python daily_etf_push.py $ARGS
 
+      # 月度体检：每月第一次盘后推送顺带生成，单独发一条微信，不挤进每日正文。
+      # 不另开 cron：GitHub 的 schedule 对本仓库本来就不注册，外部定时器只驱动
+      # 现有两个窗口，挂在 close 这一步上最稳（也就不用再配一个触发器）。
+      # --if-due 先判断当月报告在不在，在就当月剩下的每一天零请求直接退出。
+      - name: 月度滚动体检
+        continue-on-error: true
+        if: success() && steps.slot.outputs.slot == 'close'
+        env:
+          SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+        run: python monthly_review.py --if-due --save --notify
+
       # 台账只在盘后那条写（盘中价随时在变，记下去会把当天信号定成当时那个快照）
       # 提交失败不影响推送结果：第二天照常跑，不阻断主流程。
       # 溢价历史回填（ensure_prem_history）也在盘后这条里发生，所以新建的动态基准
@@ -164,6 +175,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add signals.json
+          if [ -d review ]; then
+            git add review
+          fi
           if git diff --cached --quiet; then
             echo "台账无变化，跳过提交"
             exit 0
