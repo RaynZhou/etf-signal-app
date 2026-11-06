@@ -137,19 +137,21 @@ MIN_BARS = 65
 MA_LONG = 200
 BAND_K = 0.5
 
-# 溢价率提示线（同日收盘 / 单位净值 - 1，正数表示溢价）
+# 溢价率（同日收盘 / 单位净值 - 1，正数表示溢价）用两把尺子量两件事：
 #
-# 固定阈值注定会失效，因为溢价水平本身在漂移。159941 实测年度中位数：
-#   2018 +0.09%  2019 -0.82%  2020 +1.06%  2021 -0.21%  2022 +0.58%
-#   2023 +0.53%  2024 +1.88%  2025 +2.55%  2026 +6.80%（最高 18.85%）
-# 同样一个 8%，在 2019 年是百年一遇，在 2026 年却是家常便饭。
-#
-# 所以分两档：台账里该品种的溢价记录不足 LEDGER_PREM_MIN 天时，用绝对阈值兜底；
-# 攒够了就改用它自己的中位数 + 偏离量，自动适应漂移。
-# 中位数只取最近 LEDGER_PREM_WINDOW 天：全历史中位数会被旧样本拽住，在单边漂移下
-# 反而比固定阈值更误导（推导见 calc_prem_baseline 的 docstring）。
+# ① 绝对水平 = 成本。15.6% 就是每份多付 15.6%，净值要涨 15.6% 才回本。
+#    它不需要跟谁比，也不预测方向——额度受限的跨境品种可以长期维持高溢价。
+#    这两条线只决定行首标签（溢价高 / 溢价重）和「不宜加仓」的绝对条件，
+#    是陈述事实，不是报警。
 PREMIUM_WARN = 8.0
 PREMIUM_HEAVY = 12.0
+#
+# ② 相对自身中位的偏离 = 异常。固定阈值在这里确实注定失效，因为溢价中枢本身在漂移
+#    （159941 年度中位数：2018 +0.09% → 2026 +6.80%，最高 18.85%）。
+#    同一个 8% 在 2019 年是百年一遇，在 2026 年是家常便饭——所以「今天是否反常」
+#    只能拿它自己的历史当尺子，台账攒够 LEDGER_PREM_MIN 天就用最近
+#    LEDGER_PREM_WINDOW 天的中位数（全历史中位数会被旧样本拽住，见 calc_prem_baseline）。
+#    这两条线只决定 `偏+Xpp` 出不出、加不加 ⚠，不参与成本判断。
 PREMIUM_DEV_WARN = 4.0
 PREMIUM_DEV_HEAVY = 7.0
 # 启用门槛从 20 提到 40：台账每天只贡献 1 个样本，20 个样本的中位数极不稳定
@@ -680,24 +682,22 @@ def fetch_fund_snapshot(symbols, max_workers=6):
     return out
 
 
-def calc_long_trend(df):
-    """长期趋势状态：1 = 长期↑，0 = 长期↓，None = 数据不足
+def long_state_series(df):
+    """长期趋势状态的逐日序列：1 = 长期↑，0 = 长期↓，NaN = MA200 未暖机
 
-    用滞回带判定：站上 MA200 且高出 0.5 倍日均波动才算转强，
-    跌破 MA200 且低出 0.5 倍日均波动才算转弱，中间地带维持原状态。
-
-    必须从序列开头逐根递推：当前状态取决于上一次是从哪个方向进来的，
-    只看最后一根算不出滞回结果——加缓冲带的全部意义就在这里。
+    递推规则与 calc_long_trend 完全一致，只是每根的结果都留下——app 要按区间着色，
+    只看末值画不出来；两边各写一遍递推早晚会分叉，所以 calc_long_trend 改为取这里
+    的末值。暖机段给 NaN 而不是 0：holding 的初值 0 只表示「还没被证明向上」，
+    画成「长期↓」会在图开头凭空造出一段下跌区间。
     """
     import pandas as pd
     close = df["收盘"]
     ma = close.rolling(MA_LONG).mean()
-    if ma.iloc[-1] != ma.iloc[-1]:
-        return None
     vol = close.pct_change().rolling(20).std()
     up_band = ma * (1 + BAND_K * vol)
     dn_band = ma * (1 - BAND_K * vol)
 
+    state = pd.Series(float("nan"), index=df.index, dtype="float64")
     holding = 0
     for i in range(len(close)):
         u, d = up_band.iloc[i], dn_band.iloc[i]
@@ -707,7 +707,23 @@ def calc_long_trend(df):
             holding = 1
         elif holding == 1 and close.iloc[i] < d:
             holding = 0
-    return holding
+        state.iloc[i] = holding
+    return state
+
+
+def calc_long_trend(df):
+    """长期趋势状态：1 = 长期↑，0 = 长期↓，None = 数据不足
+
+    用滞回带判定：站上 MA200 且高出 0.5 倍日均波动才算转强，
+    跌破 MA200 且低出 0.5 倍日均波动才算转弱，中间地带维持原状态。
+
+    必须从序列开头逐根递推：当前状态取决于上一次是从哪个方向进来的，
+    只看最后一根算不出滞回结果——加缓冲带的全部意义就在这里。
+    递推在 long_state_series 里，这里只取末值，推送口径与 app 图表共用一份实现。
+    """
+    import pandas as pd
+    last = long_state_series(df).iloc[-1]
+    return None if pd.isna(last) else int(last)
 
 
 def calculate_rsi(series, period=14):
@@ -860,24 +876,59 @@ def fetch_data(symbol, max_retries=2):
     return None
 
 
-def prem_flag(prem, base=None):
-    """溢价是否该提示：'' / 'warn' / 'heavy'
+def prem_flag(prem, base):
+    """相对本品种自身基准的异常档：'' / 'warn' / 'heavy'
 
-    有台账中位数就按「本品种中位数 + 偏离量」判，没有才退回绝对阈值。
+    只管「今天是否反常」，不管「贵不贵」——没有基准就返回空串，绝不退回绝对阈值：
+    那会把两件事又混回一把尺子（绝对水平由 premium_cost_label 单独表达）。
     抽成函数是为了让 app 和推送用同一条线——两边各写一遍阈值，早晚会分叉。
+    """
+    if prem is None or base is None:
+        return ""
+    dev = prem - base
+    if dev >= PREMIUM_DEV_HEAVY:
+        return "heavy"
+    if dev >= PREMIUM_DEV_WARN:
+        return "warn"
+    return ""
+
+
+def premium_cost_label(prem):
+    """绝对溢价的成本标签：'' / '高' / '重'
+
+    陈述每份多付几个点，与它自己过去怎么走无关。159941 常年 7~18%，
+    所以它几乎每天都带「重」——这是事实，不是噪音；会疲劳的是报警符号，不是读数。
     """
     if prem is None:
         return ""
-    if base is None:
-        warn, heavy = PREMIUM_WARN, PREMIUM_HEAVY
-    else:
-        warn = base + PREMIUM_DEV_WARN
-        heavy = base + PREMIUM_DEV_HEAVY
-    if prem >= heavy:
-        return "heavy"
-    if prem >= warn:
-        return "warn"
+    if prem >= PREMIUM_HEAVY:
+        return "重"
+    if prem >= PREMIUM_WARN:
+        return "高"
     return ""
+
+
+def premium_display(prem, base=None, label=""):
+    """溢价的展示串：绝对值（成本）+ 相对偏离（异常）
+
+        溢价重 18.1%(11-04) · 偏+6.5pp
+
+    左侧永远是绝对值，括号是该溢价对应的净值日；`偏±Xpp` 只在台账基准可用
+    且偏离到 +4pp 时出现，到 +7pp 再加 ⚠。两把尺子各管一件事：
+    18.1% 说明多付了多少，+6.5pp 说明这个数字在它自己的历史里算不算反常。
+    上一版只有后者，于是 159941 的重警线被自己的中位数抬到 18.8%——成本信号被异常信号吞掉了。
+    """
+    if prem is None:
+        return ""
+    text = f"溢价{premium_cost_label(prem)} {prem:.1f}%"
+    if label:
+        text += f"({label})"
+    tier = prem_flag(prem, base)
+    if tier:
+        text += f" · 偏{prem - base:+.1f}pp"
+        if tier == "heavy":
+            text += "⚠"
+    return text
 
 
 # 「逆风 + 贵」组合约束的展示文案
@@ -885,23 +936,47 @@ GATE_LABEL = "不宜加仓"
 GATE_TEXT = f"**{GATE_LABEL}**"
 
 
-def gate_note(long_state, prem, prem_base_value):
-    """同时满足「长期↓」和「溢价到重警线」才触发的约束，返回要追加的文字（不触发给空串）
+def gate_note(long_state, prem):
+    """同时满足「长期↓」和「绝对溢价重」才触发的约束，返回要追加的文字（不触发给空串）
 
     为什么这两个叠在一起才有意义：长期↓ 单独看只是「价格在年线下方」，溢价高单独看
     只是「买的人多」，两个各自都被证伪过或只是当期描述。合起来说的是一件有依据的事——
-    此刻用市价买入，既站在趋势的反方向上，又在为该品种历史上少见的价格偏离付钱。
+    此刻用市价买入，既站在趋势的反方向上，又在为一笔确定的成本付钱。
     它的正当性来自两个当期已经存在的事实，不来自对明天涨跌的预测。
 
-    溢价基准取该品种自己的中位数（prem_base_value），没有基准时按绝对阈值判——
-    和 prem_flag 完全同一条线，不另外定义什么叫「贵」。
+    第二个条件用绝对溢价而不是「相对本品种中位 +7pp」：后者回答的是「今天是否反常」。
+    159941 的中位约 11.8%，重警线因此被抬到 18.8%，而它 90 天里的最高溢价才 18.85%——
+    用相对尺子做成本判断，等于把最贵的那只永久豁免。
     推送和 app 都调这个函数拿文案：两边各写一遍措辞，早晚分叉（已经有过教训）。
     """
     if long_state != 0 or prem is None:
         return ""
-    if prem_flag(prem, prem_base_value) != "heavy":
+    if prem < PREMIUM_HEAVY:
         return ""
     return GATE_TEXT
+
+
+# 长期方向 × 绝对溢价 的 2×2 事实矩阵，四格文案只此一份
+# 推送在行尾追加当前格，app 用同一份文字高亮图表下方的四格——两边各写一遍就会分叉。
+# 它不参与任何评分：两件事各说各的，没有权重，也没有「多少分以上买」。
+MATRIX_CELLS = {
+    (1, False): "趋势内·成本正常",
+    (1, True): "趋势内·买入成本高",
+    (0, False): "趋势走弱·成本正常",
+    (0, True): "既贵又逆风",
+}
+
+
+def matrix_label(long_state, prem):
+    """当前落在 2×2 的哪一格；缺长期状态或溢价时返回空串
+
+    场外基金 long 恒为 None，所以不会有格子——模型没给这两项判定，
+    行里就不硬造一个结论。溢价按绝对值（>= PREMIUM_HEAVY 算「重」）分档，
+    与成本标签同一把尺子；相对偏离只管「今天反不反常」，不进这一格。
+    """
+    if long_state is None or prem is None:
+        return ""
+    return MATRIX_CELLS.get((int(long_state), prem >= PREMIUM_HEAVY), "")
 
 
 def find_last_cross(df, lookback=EVENT_LOOKBACK):
@@ -935,6 +1010,28 @@ def find_last_cross(df, lookback=EVENT_LOOKBACK):
     return "", None, ""
 
 
+def cross_points(df):
+    """窗口内全部 MA20/MA60 交叉，按时间升序返回 [(日期, 'golden'|'death')]
+
+    判定式与 find_last_cross 逐字一致（prev<= 且 cur> 算金叉，prev>= 且 cur< 算死叉），
+    所以图上每一枚标记和推送文案认的是同一个事件。不复用 find_last_cross：
+    它只回答「最近一次」，画 400 根要调几百次，而且拿不到更早的标记。
+    NaN 参与比较恒为 False，暖机不足的早期下标自动跳过。
+    """
+    if df is None or len(df) < 2:
+        return []
+    ma20, ma60 = df["MA20"], df["MA60"]
+    prev20, prev60 = ma20.shift(1), ma60.shift(1)
+    dates = df["日期"].astype(str).str[:10]
+    points = []
+    for i in range(1, len(df)):
+        if prev20.iloc[i] <= prev60.iloc[i] and ma20.iloc[i] > ma60.iloc[i]:
+            points.append((dates.iloc[i], "golden"))
+        elif prev20.iloc[i] >= prev60.iloc[i] and ma20.iloc[i] < ma60.iloc[i]:
+            points.append((dates.iloc[i], "death"))
+    return points
+
+
 def evaluate_df(df, show_long=True):
     """从日线序列算出全部指标与信号。不取数、不渲染、不联网
 
@@ -961,6 +1058,8 @@ def evaluate_df(df, show_long=True):
 
     df["MA20"] = df["收盘"].rolling(20).mean()
     df["MA60"] = df["收盘"].rolling(60).mean()
+    # 供 app 画年线；与 long_state_series 里那条均线是同一个表达式、同一个常量
+    df["MA200"] = df["收盘"].rolling(MA_LONG).mean()
     df["RSI"] = calculate_rsi(df["收盘"], 14)
 
     latest = df.iloc[-1]
@@ -999,7 +1098,7 @@ def evaluate(symbol, now, spot_prices=None, use_spot=False, fund_snap=None,
     """取数 + 补当日价 + 算指标，推送和 app 共用这一个入口
 
     返回 dict；ok=False 时只有 reason 有意义。溢价原样带出（prem / nav_date），
-    要不要提示、要不要加⚠交给 prem_flag 判——阈值属于展示决策，不该混进取数。
+    怎么展示（绝对值 + 相对偏离）交给 premium_display 判——展示决策不该混进取数。
     溢价基准（台账中位数）也不在这里处理：同一个数字在「有基准」和「无基准」
     两种情形下的含义不同，取数层不该知道台账长什么样。
 
@@ -1091,8 +1190,8 @@ def analyze_one(symbol, now, spot_prices, use_spot=True, fund_snap=None,
     分红台阶踢来踢去（十四年持续判↑、翻转 0 次），但正因如此它对这个品种毫无区分度
     —— 一条永远为真的线印出来只是噪音，还会让人误以为它和 ETF 用同一个阈值。
     RSI 不一样，它是会被分红砸错的，所以这个字段必须留、也必须算对。
-    prem_base 是该品种自己的溢价中位数（台账攒够了才有），
-    有它就用「中位数 + 偏离量」判定，没它就用绝对阈值兜底。
+    prem_base 是该品种自己的溢价中位数（台账攒够了才有）。
+    只用来算「相对偏离」，绝对水平不用它——见 premium_display。
     """
     try:
         ev = evaluate(symbol, now, spot_prices, use_spot, fund_snap, show_long)
@@ -1110,22 +1209,15 @@ def analyze_one(symbol, now, spot_prices, use_spot=True, fund_snap=None,
         long_state = ev["long"]
 
         # 溢价只要取到就印，不再「不严重就不印」：不印的话读者无法区分
-        # 「没有溢价数据」和「溢价正常」，而溢价是这个模型唯一还有证据支持的维度。
-        # 阈值只决定加不加 ⚠——文字标签仍然是「净值日」，不是「此刻」。
-        # 159941 的动态基准中位是 11.55%，所以 14.5% 在它自己的尺度上只是偏高而非异常；
-        # 同期固定阈值（heavy 12%）会让它天天报⚠。
+        # 「没有溢价数据」和「溢价正常」。展示串同时给绝对值（成本）和相对偏离（异常），
+        # 规则见 premium_display——两者不能合并成一把尺子。
         prem = ev["prem"]
-        prem_label = ev["prem_label"]
-        prem_text = ""
-        if prem is not None:
-            prem_text = f"溢价 {prem:.1f}%"
-            if prem_label:
-                prem_text += f"({prem_label})"
-            if prem_flag(prem, (prem_base or {}).get(symbol)) == "heavy":
-                prem_text += "⚠"
+        prem_text = premium_display(prem, (prem_base or {}).get(symbol), ev["prem_label"])
+        # 四格结论：长期方向 + 绝对溢价落在哪一格。场外基金缺这两项，不追加
+        cell = matrix_label(long_state, prem)
 
         # 「逆风 + 贵」的组合约束；场外基金 long 为 None，永远不会触发
-        gate = gate_note(long_state, prem, (prem_base or {}).get(symbol))
+        gate = gate_note(long_state, prem)
 
         # Markdown 列表项：- 图标 **代码** 产品名 · 信号 · RSI · 长期 · 溢价 · 基准日
         # 名称紧跟代码、用空格隔开（不拿 · 隔，否则一行被切成太多块反而难读）
@@ -1143,6 +1235,8 @@ def analyze_one(symbol, now, spot_prices, use_spot=True, fund_snap=None,
             parts.append("**长期↓**")
         if prem_text:
             parts.append(prem_text)
+        if cell:
+            parts.append(cell)
         if gate:
             parts.append(gate)
         suffix = bar_suffix(bar_date, now)
@@ -1165,6 +1259,8 @@ def analyze_one(symbol, now, spot_prices, use_spot=True, fund_snap=None,
             # 台账只存净值口径的 prem（基准是同一分布的中位数，混入口径就失效了）。
             # 目前两者是同一个值；将来若接入实时溢价，这里就要保持净值口径不变。
             "prem_nav": prem,
+            # 溢价对应的净值日：变化层要靠它区分「溢价真的动了」和「只是换了净值日」
+            "prem_nav_date": ev.get("prem_nav_date") or "",
             "bar_date": bar_date,
             "source": ev.get("source", ""),
             "bars": ev.get("bars", 0),
@@ -1182,7 +1278,9 @@ def analyze_one(symbol, now, spot_prices, use_spot=True, fund_snap=None,
 # 为什么需要落盘：Actions 每次跑都是全新容器，不存就永远是「第一次」
 # 台账结构（紧凑键名，控制文件体积）：
 #   {"version":1, "start":"摘要日", "days": {"2026-10-30": {"159941":
-#    {"sig":事件, "long":状态, "prem":溢价, "gate":是否触发不宜加仓}}}}
+#    {"sig":事件, "sig_date":交叉日, "long":状态, "prem":溢价,
+#     "prem_date":溢价对应的净值日, "gate":是否触发不宜加仓}}}}
+# prem_date 用于变化层：只有它变了，两个溢价才不是同一个净值日的重复读数。
 # gate 只存事实、不进 verify_ledger 的胜率结算：它不是一个可交易信号，
 # 拿它去算胜率等于把一个成本约束当成方向判断——那正是金叉已经被证伪的那类错。
 
@@ -1230,6 +1328,43 @@ def save_ledger(ledger):
         return False
 
 
+def prem_history(ledger, code=None):
+    """台账里的溢价序列 {日期: 溢价%}，按日期升序；code=None 时返回 {代码: 序列}
+
+    合并两个来源，同一天以 days 为准（它是当日实算的）：
+      ① prem_hist（backfill_prem 回填的历史溢价）——让基准立刻可用，不必空等 40 个交易日
+      ② days 里的 prem（每天真实推送时算出来的）
+    抽出来的原因：app 要把这条序列画成曲线和滚动中位数，而基准也是从同一条序列算的。
+    两边各自合并一次，图上那条中位线就可能和「偏+Xpp」用的尺子不是同一个数。
+    """
+    merged = {}
+    for c, series in (ledger.get("prem_hist") or {}).items():
+        if not isinstance(series, dict):
+            continue
+        bucket = merged.setdefault(c, {})
+        for d, v in series.items():
+            if v is None:
+                continue
+            try:
+                bucket[str(d)] = float(v)
+            except (TypeError, ValueError):
+                continue
+
+    for day_str, rec in (ledger.get("days") or {}).items():
+        for c, item in rec.items():
+            value = item.get("prem")
+            if value is None:
+                continue
+            try:
+                merged.setdefault(c, {})[day_str] = float(value)
+            except (TypeError, ValueError):
+                continue
+
+    if code is not None:
+        return {d: merged.get(code, {})[d] for d in sorted(merged.get(code, {}))}
+    return {c: {d: s[d] for d in sorted(s)} for c, s in merged.items()}
+
+
 def calc_prem_baseline(ledger):
     """取每只最近 LEDGER_PREM_WINDOW 个溢价观测的中位数，样本不足 LEDGER_PREM_MIN 的不给基准
 
@@ -1241,38 +1376,10 @@ def calc_prem_baseline(ledger):
     记 0、最近 60 天记 8——全历史中位数仍是 0，于是「今天的 8%」被算成偏离基准 8 个点，
     天天报⚠；中枢下移时反过来，旧的高值把基准抬住，该报的漏报。
     漂移越慢危害越大，因为每一条单独看都像「今天有点高」，几乎不像异常。
-
-    现在合并两个来源：
-      ① prem_hist（backfill_prem 回填的历史溢价）——让基准立刻可用，不必空等 40 个交易日
-      ② days 里的 prem（每天真实推送时算出来的）
-    同一天两边都有时以 days 为准（它是当日实算的）；按日期排序后取最近 60 个值。
     """
-    merged = {}
-    for code, series in (ledger.get("prem_hist") or {}).items():
-        if not isinstance(series, dict):
-            continue
-        bucket = merged.setdefault(code, {})
-        for d, v in series.items():
-            if v is None:
-                continue
-            try:
-                bucket[str(d)] = float(v)
-            except (TypeError, ValueError):
-                continue
-
-    for day_str, rec in (ledger.get("days") or {}).items():
-        for code, item in rec.items():
-            value = item.get("prem")
-            if value is None:
-                continue
-            try:
-                merged.setdefault(code, {})[day_str] = float(value)
-            except (TypeError, ValueError):
-                continue
-
     out = {}
-    for code, series in merged.items():
-        vals = [series[d] for d in sorted(series)][-LEDGER_PREM_WINDOW:]
+    for code, series in prem_history(ledger).items():
+        vals = list(series.values())[-LEDGER_PREM_WINDOW:]
         if len(vals) >= LEDGER_PREM_MIN:
             out[code] = statistics.median(vals)
     return out
@@ -1318,6 +1425,7 @@ def record_ledger(ledger, metas):
         # 只在有新值时才覆盖 prem：取不到净值的那天不应该把之前算好的溢价抹掉
         if meta.get("prem_nav") is not None:
             rec["prem"] = meta["prem_nav"]
+            rec["prem_date"] = meta.get("prem_nav_date") or ""
         # 触发与否每天都重写，不只在触发时写 1：同一个交易日可能被跑两次
         # （外部定时器一次 + 网页手动 Run 一次），只写 1 的话前一跳触发、后一跳
         # 没触发时 1 会留在原地，统计出来的频率永远偏高
@@ -1502,6 +1610,83 @@ def ledger_staleness(ledger, metas_by_code):
     return len(ref) - 1 - ref.index(last)
 
 
+# 变化层阈值：溢价变动超过这么多才报，避免把净值口径的正常抖动写成事件
+DELTA_PREM_PP = 2.0
+DELTA_MAX_LINES = 6
+
+
+def build_delta_lines(ledger, metas, now):
+    """和上一条盘后快照比，只印变化；没有变化时印一行「无状态变化」
+
+    为什么必须有这一节：消息原本全是静态读数，读者得背下昨天的推送才知道哪只翻了。
+    而趋势翻转恰好是这套模型里信息量最大的一类事件——长期↓ 是排除器，
+    它一翻，可买集合就变了。台账里早就存着前一天的状态，只是从来没印出来。
+
+    比较基准取「最近一个早于今天的台账日」，不用自然日：台账只在盘后写，
+    盘中和盘后两条都拿上一个收盘状态当「昨天」，两边口径一致。
+    必须在 record_ledger 之前调用——否则台账已被今天覆盖，delta 恒为 0。
+
+    溢价的变动带上净值日：QDII 的净值滞后 1~2 天，两个数可能根本不是同一天的口径，
+    不标日期的话「-3.9pp」会被读成溢价真的掉了 3.9 个点。
+    """
+    days = ledger.get("days") or {}
+    today = now.strftime("%Y-%m-%d")
+    prev_days = [d for d in days if d < today]
+    if not prev_days:
+        return []          # 首日：没有「上一条」可谈，整节不出现
+    prev_day = max(prev_days)
+    prev = days[prev_day]
+
+    flips, gates, crosses, prems = [], [], [], []
+    for meta in metas:
+        if not meta:
+            continue
+        code = meta.get("code") or ""
+        old = prev.get(code)
+        if not old:
+            continue       # 新加入池子的标的没有可比对象，等明天再说
+        name = FUND_NAMES.get(code, "")
+        label = f"**{code}**" + (f" {name}" if name else "")
+
+        cur_long, old_long = meta.get("long"), old.get("long")
+        if cur_long is not None and old_long is not None and cur_long != old_long:
+            flips.append(f"- {label}：长期{'↑' if old_long else '↓'} → "
+                         f"**长期{'↑' if cur_long else '↓'}**")
+
+        if meta.get("gate") and not old.get("gate") and meta.get("prem") is not None:
+            gates.append(f"- {label}：新触发 **{GATE_LABEL}**"
+                         f"（长期↓ + 绝对溢价 {meta['prem']:.1f}%）")
+
+        # 同一次交叉会连续 5 天被识别到，所以要和上一条记过的交叉日比一次
+        if (meta.get("event") and meta.get("event_days_ago") == 0
+                and old.get("sig_date") != meta.get("event_date")):
+            ev_name = EVENT_LABELS.get(meta["event"], meta["event"])
+            tail = "" if bar_is_final(now) else "（盘中，未收盘）"
+            crosses.append(f"- {label}：新增{ev_name}{tail}")
+
+        cur_prem, old_prem = meta.get("prem"), old.get("prem")
+        if cur_prem is not None and old_prem is not None:
+            diff = cur_prem - old_prem
+            if abs(diff) >= DELTA_PREM_PP:
+                old_d = (old.get("prem_date") or "")[5:]
+                new_d = (meta.get("prem_nav_date") or "")[5:]
+                old_txt = f"{old_prem:.1f}%" + (f"({old_d})" if old_d else "")
+                new_txt = f"**{cur_prem:.1f}%**" + (f"({new_d})" if new_d else "")
+                prems.append((abs(diff),
+                              f"- {label}：溢价 {old_txt} → {new_txt}（{diff:+.1f}pp）"))
+
+    lines = [f"### 🔀 较上一条（{prev_day[5:]} 收盘）", ""]
+    body = flips + gates + crosses + [text for _, text in sorted(prems, key=lambda x: -x[0])]
+    if not body:
+        lines.append("- 无状态变化")
+    else:
+        lines.extend(body[:DELTA_MAX_LINES])
+        if len(body) > DELTA_MAX_LINES:
+            lines.append(f"- …另有 {len(body) - DELTA_MAX_LINES} 项，见下方各节")
+    lines.append("")
+    return lines
+
+
 def build_ledger_lines(ledger, stats, stale=None, baseline=None):
     """拼信号跟踪段落；该 N 日样本不足 LEDGER_MIN_SAMPLE 笔时只报笔数
 
@@ -1601,6 +1786,7 @@ def build_message(now, slot, record=False):
 
     # 推送标题栏已有“ETF信号助手·时段”，正文只留时间戳，不再重复一遍
     lines = [f"**{now_str} · {slot_label(slot)}**", ""]
+    delta_at = len(lines)      # 变化层要等 metas 收齐才能算，先占住正文最前面的位置
     stale = []
     patched_count = 0
     fresh_count = 0
@@ -1685,6 +1871,10 @@ def build_message(now, slot, record=False):
     lines.append(text)
     lines.append("")
 
+    # 变化层插在正文最前面：它是这份消息里唯一「今天和昨天不一样」的部分。
+    # 必须先于 record_ledger 计算，否则台账已被今天的快照覆盖，delta 恒为 0。
+    lines[delta_at:delta_at] = build_delta_lines(ledger, metas, now)
+
     # 台账：先把当日快照落盘，再算跟踪，这样首日推送就能显示「累计 1 个交易日」
     # 按每只标的自己的 bar_date 记，不再要求全池就绪：旧条件
     # （bar_dates == {today}）在 14 只里只要有 1 只落后就导致全池当天不记录，
@@ -1753,9 +1943,8 @@ def build_message(now, slot, record=False):
     if gated:
         # 只在真触发了才解释，不触发就整行不出现——否则天天一行没人看得懂的文字很噪
         notes.append(f"⛔ 「{GATE_TEXT}」触发 {len(gated)} 只：**当期既贵又逆风**——"
-                     f"同时满足「长期↓」和「溢价到重警线」（有基准=高出本品种最近 "
-                     f"{LEDGER_PREM_WINDOW} 天中位 {PREMIUM_DEV_HEAVY:g}pp，"
-                     f"无基准=绝对 {PREMIUM_HEAVY:g}%）。这是成本约束，不是预测它会跌")
+                     f"同时满足「长期↓」和「绝对溢价 ≥ {PREMIUM_HEAVY:g}%」。"
+                     f"这是成本约束，不是预测它会跌")
     lines.extend(f"- {note}" for note in notes)
     lines.append("")
 
@@ -1765,8 +1954,10 @@ def build_message(now, slot, record=False):
     # 两者差一个量级，并列在一起等于把弱证据抬成强证据。
     # 必须带 "- " 列表前缀：上面约 170 行写过这条规矩——两个 append 之间只有一个 \n，
     # 在 Markdown 里是软换行，微信会把三句挤成一段。凑成一段就没人读完。
-    lines.append("- 💡 证据较强的两件事：**溢价率** 只和该品种自己的历史中位比（不跨品种比）、"
+    lines.append("- 💡 证据较强的两件事：**溢价绝对值** 就是每份多付的成本（不跨品种比，也不需要比）、"
                  "**长期↓** 当排除器用（↑ 内部排序≈噪声）")
+    lines.append(f"- 💡 `偏±Xpp` 相对本品种最近 {LEDGER_PREM_WINDOW} 天中位数，只回答「今天反不反常」："
+                 f"+{PREMIUM_DEV_WARN:g}pp 显示、+{PREMIUM_DEV_HEAVY:g}pp 加 ⚠，它不判断贵贱")
     lines.append("- 💡 证据较弱的一件事：**MA200 缓冲带** 只在 6 只/742 个交易日上验过，"
                  "最大回撤 19.1%→18.4%（0.7pp）——方向可能有，幅度接近噪声，别当承诺")
     lines.append("- 💡 已证伪的一件事：🟢金叉/🔴死叉 判断方向"
