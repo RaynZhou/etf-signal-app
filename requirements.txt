@@ -9,6 +9,10 @@
 streamlit
 # etf_signal_app.py 唯一入口；推送脚本不需要它，所以没放进 workflow 那份清单
 
+plotly
+# etf_signal_app.py 的交互图（价格/长期状态、RSI、溢价）。
+# 只进这份清单，不要加到 workflow 的 pip install 里——推送脚本不画图
+
 akshare
 # daily_etf_push.py：历史日线、单位净值快照。境外机器上它失败是常态，
 # 场内 ETF 有腾讯历史日线兜底，净值取不到就只是少一行溢价提示
